@@ -1,6 +1,6 @@
 ---
 name: compact-adviser
-description: Read or change compact-adviser settings for Codex - the mode (hint or off), the minimum context before a checkpoint is judged, the context budget, TypeSafe request logging, and the TypeSafe API key. Use when the user asks about compaction advice, the /compact hint, compact-adviser status, or wants to turn the adviser on or off.
+description: Read or change compact-adviser settings for Codex - the mode (hint or off), the minimum context before a checkpoint is judged, the context budget, judge request logging, the judge (OpenAI Decisions or TypeSafe Jev), and the judge's API key. Use when the user asks about compaction advice, the /compact hint, compact-adviser status, or wants to turn the adviser on or off.
 ---
 
 # compact-adviser settings
@@ -29,8 +29,9 @@ macOS or Linux and Node 22.18 or newer are required, because the CLI is TypeScri
 | `off` | Stop advising; Codex's own compaction is unaffected |
 | `threshold <tokens\|default>` | Save an absolute token minimum |
 | `budget <tokens\|off>` | Save a context budget (`off` clears it): the hint floor relaxes toward this context size, or toward the model's window if that is smaller |
-| `log <on\|off>` | Log each TypeSafe request and its outcome to a local jsonl file |
-| `key set` | Prompt for a TypeSafe API key and save it; the value is never printed |
+| `log <on\|off>` | Log each judge request and its outcome to a local jsonl file |
+| `judge <decisions\|jev>` | Choose the judge: OpenAI's Decisions API (default) or TypeSafe Jev |
+| `key set` | Prompt for the selected judge's API key and save it; the value is never printed |
 | `key clear` / `key status` | Remove the saved key, or report which source the key in effect came from |
 
 `key set` reads the key from the terminal, so ask the user to run that one themselves rather

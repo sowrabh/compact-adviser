@@ -471,12 +471,12 @@ test("every package applies the same cooldownReason gates", () => {
       reason: "Snoozed",
     },
     {
-      name: "typesafe backoff",
+      name: "judge backoff",
       tokens: 60000,
       now: 10999,
       compacted: false,
       patch: { retryAfter: 11000 },
-      reason: "TypeSafe backoff",
+      reason: "Judge backoff",
     },
     {
       name: "post-compaction no baseline",

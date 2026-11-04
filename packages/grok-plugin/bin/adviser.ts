@@ -679,7 +679,7 @@ function statusText(): string {
       }`,
     );
     const diagnostic = loadDiagnostic(diagnosticPath(dataDir(env()), sessionId));
-    if (diagnostic) lines.push(`Last TypeSafe outcome: ${diagnostic}.`);
+    if (diagnostic) lines.push(`Last judge outcome: ${diagnostic}.`);
   }
   return lines.join("\n");
 }

@@ -293,8 +293,8 @@ test("a refused judgment backs off, reports its kind, and never hints", async (t
   const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
   assert.ok(!row.stdout.includes(HINT));
   const status = await runCli(["status"], { lab: l });
-  assert.match(status.stdout, /Last TypeSafe outcome: authentication/);
-  assert.match(status.stdout, /TypeSafe backoff/);
+  assert.match(status.stdout, /Last judge outcome: authentication/);
+  assert.match(status.stdout, /Judge backoff/);
 });
 
 test("TYPESAFE_BASE sends the judgment to that base's /v1/systemone", async (t) => {
@@ -323,8 +323,8 @@ test("an invalid TYPESAFE_BASE asks nobody, never hints, and reports why", async
   const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
   assert.ok(!row.stdout.includes(HINT));
   const status = await runCli(["status"], { lab: l });
-  assert.match(status.stdout, /Last TypeSafe outcome: configuration/);
-  assert.match(status.stdout, /TypeSafe backoff/);
+  assert.match(status.stdout, /Last judge outcome: configuration/);
+  assert.match(status.stdout, /Judge backoff/);
 });
 
 test("request logging writes the request and the outcome, and never the key", async (t) => {
@@ -453,7 +453,7 @@ test("a TypeSafe timeout aborts the in-flight request and stays silent", async (
   assert.equal(fixture.bodies.length, 1);
   const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
   assert.ok(!row.stdout.includes(HINT));
-  assert.match((await runCli(["status"], { lab: l })).stdout, /Last TypeSafe outcome: timeout/);
+  assert.match((await runCli(["status"], { lab: l })).stdout, /Last judge outcome: timeout/);
 });
 
 test("an oversized TypeSafe response is refused without a hint", async (t) => {
@@ -463,7 +463,7 @@ test("an oversized TypeSafe response is refused without a hint", async (t) => {
   assert.equal(fixture.bodies.length, 1);
   const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
   assert.ok(!row.stdout.includes(HINT));
-  assert.match((await runCli(["status"], { lab: l })).stdout, /Last TypeSafe outcome: response/);
+  assert.match((await runCli(["status"], { lab: l })).stdout, /Last judge outcome: response/);
 });
 
 test("setup, doctor, items, and hint are not commands", async (t) => {

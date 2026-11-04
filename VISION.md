@@ -46,7 +46,7 @@ Every install has a single kill switch that beats every other enablement path.
 ## Accuracy is the entry price, for every judge and every feature
 
 The judge is a dependency, not an identity: no provider is part of what this product is, and the shipped default is simply the most accurate judge measured.
-The product never silently substitutes a cheaper one.
+The product never silently substitutes a cheaper one. This fork ships OpenAI's Decisions judge as its default by its owner's explicit choice before it has been measured this way; Jev stays one setting away, the Decisions floor schedule is a stated placeholder until the measurement exists, and nothing ever falls back from one judge to the other.
 A person may explicitly choose a different judge, including a local one, and may accept somewhat less accuracy for what it buys them, provided that judge has been rigorously evaluated and is good enough for regular use.
 What is refused is an unevaluated heuristic that guesses at completion, because guessing is what the product exists to end.
 The same rule governs features: one that cannot be built accurately is left absent and documented, not approximated by the most likely answer.

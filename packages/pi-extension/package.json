@@ -12,13 +12,13 @@
     "context-management",
     "checkpoint"
   ],
-  "homepage": "https://github.com/kunchenguid/compact-adviser#readme",
+  "homepage": "https://github.com/sowrabh/compact-adviser#readme",
   "bugs": {
-    "url": "https://github.com/kunchenguid/compact-adviser/issues"
+    "url": "https://github.com/sowrabh/compact-adviser/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kunchenguid/compact-adviser.git",
+    "url": "git+https://github.com/sowrabh/compact-adviser.git",
     "directory": "packages/pi-extension"
   },
   "files": [

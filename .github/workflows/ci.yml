@@ -75,6 +75,11 @@ jobs:
       - name: Install pinned Claude Code
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+      # Newer Claude Code writes the plugin API declarations only when a session loads the
+      # plugin, which scripts/plugin-types.mjs does under tmux.
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
       - name: Install Claude mod
         run: npm --prefix packages/claude-mod ci --ignore-scripts
 

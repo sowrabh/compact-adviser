@@ -72,6 +72,8 @@ writeFileSync(join(project, ".claude", "commands", "marker.md"), markerSkill);
 const jevRequests = [];
 const summaries = [];
 const liveEvents = [];
+// Keep-warm forks: the session's own request with the one-line ping after it.
+const forks = [];
 const verdict = { completed: 0.99, handsOn: 0.99 };
 
 function jevAnswer() {
@@ -120,6 +122,12 @@ function reply(body) {
       input: 70000,
     };
   }
+  if (text.includes("Reply with exactly: OK")) {
+    forks.push(Date.now());
+    liveEvents.push("fork");
+    // A hit: the cache served the replayed prefix.
+    return { text: "OK", input: 16, cacheRead: 70000 };
+  }
   if (text.includes(MARKER_BODY) || /(?:^|\n)\/marker\b/.test(text)) {
     writeFileSync(MARKER, "ran\n");
     liveEvents.push("marker");
@@ -136,7 +144,7 @@ function reply(body) {
 }
 
 function send(res, body) {
-  const { text, input } = reply(body);
+  const { text, input, cacheRead = 0 } = reply(body);
   const message = {
     id: `msg_${Date.now()}`,
     type: "message",
@@ -149,7 +157,7 @@ function send(res, body) {
       input_tokens: input,
       output_tokens: 40,
       cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      cache_read_input_tokens: cacheRead,
     },
   };
   if (!body.stream) {
@@ -176,9 +184,10 @@ function send(res, body) {
     });
   }
   event("content_block_stop", { index: 0 });
+  // As the real API does, the closing delta carries the whole usage, cache reads included.
   event("message_delta", {
     delta: { stop_reason: "end_turn", stop_sequence: null },
-    usage: { output_tokens: 40 },
+    usage: message.usage,
   });
   event("message_stop", {});
   res.end();
@@ -585,16 +594,18 @@ try {
 
   // Before-compact: a skill-backed slash command runs, then compaction, and a typed
   // prompt while that turn is pending leaves the conversation uncompacted.
-  function setBeforePrompt(value) {
+  function setOptions(patch) {
     const settingsPath = join(config, "settings.json");
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     const name = Object.keys(settings.pluginConfigs ?? {}).find((n) =>
       n.startsWith("compact-adviser"),
     );
     if (!name) throw new Error("compact-adviser plugin config is missing");
-    settings.pluginConfigs[name].options.beforeCompactPrompt = value;
-    settings.pluginConfigs[name].options.mode = "auto";
+    Object.assign(settings.pluginConfigs[name].options, patch);
     writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  }
+  function setBeforePrompt(value) {
+    setOptions({ beforeCompactPrompt: value, mode: "auto" });
   }
 
   step = "before-compact skill";
@@ -659,6 +670,60 @@ try {
     throw new Error(`[${step}] compaction notice appeared after the interrupting prompt`);
   }
   pass("a prompt typed while the before-compact turn is pending does not compact");
+
+  // Walking away: a 6-second idle point stands in for the 50 minutes before a 1-hour cache
+  // lapses. A finished checkpoint that did not clear the turn-end floor compacts once.
+  step = "walk-away compaction";
+  try {
+    tmux("kill-server");
+  } catch {}
+  setOptions({ mode: "auto", beforeCompactPrompt: "", idleMinutes: 0.1, keepWarmHours: 8 });
+  verdict.completed = 0.99;
+  verdict.handsOn = 0.2;
+  const summariesBeforeAway = summaries.length;
+  launch(true);
+  await ready();
+  await command("E2E-PROMPT-1 a finished but coordinating unit");
+  await waitText("compact-adviser: automatic compaction completed", 60000);
+  if (summaries.length !== summariesBeforeAway + 1) {
+    throw new Error(`[${step}] expected one compaction once the person walked away`);
+  }
+  if (!screen().includes("You were away")) {
+    throw new Error(`[${step}] the transcript line does not say the person was away`);
+  }
+  if (forks.length !== 0) throw new Error(`[${step}] a finished checkpoint was kept warm`);
+  pass("walking away from a finished checkpoint compacts once, without keeping it warm");
+
+  // An unfinished checkpoint never compacts on walk-away; from the second exchange on its
+  // cache is kept warm with forks, and typing in the prompt box stops them.
+  step = "keep-warm";
+  try {
+    tmux("kill-server");
+  } catch {}
+  verdict.completed = 0.3;
+  verdict.handsOn = 0.99;
+  const summariesBeforeWarm = summaries.length;
+  launch(true);
+  await ready();
+  await command("E2E-PROMPT-1 start the work");
+  await waitFor(() => jevRequests.length > 0, "the first judgment", 60000);
+  await command("E2E-PROMPT-2 keep going");
+  await waitFor(() => forks.length >= 2, "two keep-warm forks", 60000);
+  if (summaries.length !== summariesBeforeWarm) {
+    throw new Error(`[${step}] an unfinished checkpoint was compacted on walk-away`);
+  }
+  if (!/^❯[\s\u00a0]*$/m.test(screen()) || screen().includes("Reply with exactly")) {
+    throw new Error(`[${step}] the keep-warm ping reached the transcript\n${screen()}`);
+  }
+  type("x");
+  const forksWhenTyping = forks.length;
+  await sleep(15000);
+  if (forks.length > forksWhenTyping + 1) {
+    throw new Error(`[${step}] typing in the prompt box did not stop keep-warm`);
+  }
+  pass(
+    "an unfinished checkpoint is kept warm with forks that stay out of the transcript, and typing stops them",
+  );
   console.log(`\n${results.length} live checks passed on Claude Code ${version}.`);
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);

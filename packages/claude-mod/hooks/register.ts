@@ -17,6 +17,10 @@
 //   `session.compact` hook never sees its own automatic compaction; that path resets the
 //   session's counters itself. It rejects while a turn is running; call it from
 //   `turn.complete` or later.
+// - Once the person walks away from a settled answer (no prompt, command, turn, or typing until
+//   just before the prompt cache would lapse), confirmed auto mode compacts a finished session
+//   or keeps an unfinished one's cache warm with `$.model.fork`, whose request and reply stay
+//   out of the transcript. lib/idle.ts owns that decision.
 // - `$.prompt.submit` rejects text that starts with `/` and does not expand slash commands
 //   or `@file` mentions (verified on Claude Code 2.1.294). A before-compact value that
 //   starts with `/` is run with `$.command.run` instead. Example value: `/stow`.
@@ -46,6 +50,15 @@ import {
 import { disabledByEnv } from "../lib/disable.ts";
 import { formatKeyStatus, type KeySource, parseDotenvKey, resolveApiKey } from "../lib/env.ts";
 import {
+  type CacheTtl,
+  cacheHeld,
+  cacheTtl,
+  idleDelayMs,
+  KEEP_WARM_PROMPT,
+  SHORT_TTL_MS,
+  walkAwayAction,
+} from "../lib/idle.ts";
+import {
   API_KEY_ENV,
   contextPressure,
   DECISIONS_ENDPOINT,
@@ -53,6 +66,7 @@ import {
   decisionsRequestBody,
   effectiveBudget,
   floorFor,
+  idleFloor,
   JudgeError,
   type JudgeName,
   judge,
@@ -60,6 +74,7 @@ import {
   judgeUnavailableMessage,
   qualifies,
   requestBody,
+  score,
   typesafeEndpoint,
   type Verdict,
 } from "../lib/judge.ts";
@@ -127,6 +142,22 @@ let abandonedDispatch: { key: string } | undefined;
 // started yet.
 let foreignSubmitted = false;
 let diagnostic = "";
+// The walk-away plan for the latest settled answer: armed at its turn end, dropped at any sign
+// of the person, and carried from one keep-warm ping to the next until it ends.
+let away:
+  | {
+      seq: number;
+      generation: number;
+      key: string;
+      since: number;
+      ttl: CacheTtl;
+      delayMs: number;
+      /** The turn-end score of this checkpoint, when the judge answered. */
+      score?: number;
+      pings: number;
+    }
+  | undefined;
+let awaySeq = 0;
 // The settings pane: one list of rows, as the Pi extension's menu, each opening a view
 // of its own; Enter on an option or a saved value returns to the list. A save hot-reloads
 // the module, so this scratch resets to the list on its own.
@@ -396,12 +427,21 @@ async function armBeforeCompact(
 }
 
 /** Runs the host compaction path. Call only between turns. */
-async function compactNow($: EngineInterface, key: string): Promise<void> {
+async function compactNow(
+  $: EngineInterface,
+  key: string,
+  when: "checkpoint" | "away" = "checkpoint",
+): Promise<void> {
   if (compacting) return;
   compacting = true;
+  away = undefined;
   // A status line, not a toast: the host drops a toast within two seconds of the last,
   // which would swallow the completion notice of a quick compaction.
-  $.ui.status("compacting at a checkpoint (experimental auto)…");
+  $.ui.status(
+    when === "away"
+      ? "compacting while you are away (experimental auto)…"
+      : "compacting at a checkpoint (experimental auto)…",
+  );
   let failure: string | undefined;
   let tokens: { before?: number; after?: number } = {};
   try {
@@ -436,7 +476,7 @@ async function compactNow($: EngineInterface, key: string): Promise<void> {
       : "compaction completed.";
   // The dim transcript line (never sent to the model) records the automatic action even
   // when the host throttles the toast. Claude Code prefixes $.ui.log with the plugin name.
-  $.ui.log(`automatic ${completed}`);
+  $.ui.log(when === "away" ? `automatic ${completed} You were away.` : `automatic ${completed}`);
   $.ui.toast(completed);
   clearStatus($);
 }
@@ -535,6 +575,8 @@ async function judgeCheckpoint($: EngineInterface, epoch: number): Promise<void>
       !qualifies(result, usageFraction(context, latest.contextBudgetTokens), profile) ||
       (auto && !latest.autoAcknowledged)
     ) {
+      // Not this checkpoint's moment; the walk-away decision weighs the same score later.
+      if (away?.generation === epoch) away.score = score(result, profile);
       await $.store.set(key, state);
       return;
     }
@@ -563,9 +605,124 @@ async function judgeCheckpoint($: EngineInterface, epoch: number): Promise<void>
   }
 }
 
+/** The prompt-cache TTL the engine writes with, from its switches and the latest reply. */
+async function engineCacheTtl($: EngineInterface, subscription: boolean): Promise<CacheTtl> {
+  return cacheTtl({
+    force5m: await $.env.get("FORCE_PROMPT_CACHING_5M"),
+    enable1h: await $.env.get("ENABLE_PROMPT_CACHING_1H"),
+    disabled: await $.env.get("DISABLE_PROMPT_CACHING"),
+    subscription,
+  });
+}
+
+/** Drops the walk-away plan: the person is back, or the session moved on. */
+function cancelAway(): void {
+  away = undefined;
+}
+
+/** Arms the walk-away decision for the answer that just settled, in confirmed auto only. */
+async function armAway(
+  $: EngineInterface,
+  config: Config,
+  key: string,
+  now: number,
+  subscription: boolean,
+): Promise<void> {
+  away = undefined;
+  if (config.mode !== "auto" || !config.autoAcknowledged) return;
+  const ttl = await engineCacheTtl($, subscription);
+  const seq = ++awaySeq;
+  away = {
+    seq,
+    generation,
+    key,
+    since: now,
+    ttl,
+    delayMs: idleDelayMs(ttl, config.idleMinutes),
+    pings: 0,
+  };
+  scheduleAway($, seq, away.delayMs);
+}
+
+function scheduleAway($: EngineInterface, seq: number, delayMs: number): void {
+  $.clock.after(delayMs, () => {
+    void onAway($, seq).catch(() => {
+      if (away?.seq === seq) away = undefined;
+    });
+  });
+}
+
+/**
+ * The idle point: the person has been away since the answer settled. A finished checkpoint
+ * compacts once while the cache is still warm; anything else may keep the cache warm.
+ */
+async function onAway($: EngineInterface, seq: number): Promise<void> {
+  const plan = away;
+  if (
+    plan?.seq !== seq ||
+    plan.generation !== generation ||
+    compacting ||
+    judging ||
+    beforeCompact ||
+    foreignSubmitted
+  )
+    return;
+  // A draft in the prompt box means the person is there, typing or about to.
+  if ((await $.prompt.read()).text.trim()) {
+    if (away === plan) away = undefined;
+    return;
+  }
+  const config = await loadConfig($);
+  const { state } = await loadState($);
+  const { context } = await $.session.usage();
+  const now = await $.clock.now();
+  if (away !== plan) return;
+  const profile = parseProfile(config.profile, config.judge);
+  const tokens = context.tokens;
+  // Cooldowns (backoff, snooze, the wait after a compaction) block compaction, not warming.
+  const cooled = typeof tokens === "number" && cooldownReason(state, tokens, now) === undefined;
+  const decision = walkAwayAction({
+    auto: config.mode === "auto" && config.autoAcknowledged,
+    tokens,
+    minContextTokens: config.minContextTokens,
+    score: cooled ? plan.score : undefined,
+    idleFloor: idleFloor(profile, config.judge),
+    completed: state.completed,
+    caching: plan.ttl.caching,
+    keepWarmHours: config.keepWarmHours,
+    idleSince: plan.since,
+    now,
+    pings: plan.pings,
+    ttlMs: plan.ttl.ttlMs,
+  });
+  if (decision.action === "none") {
+    away = undefined;
+    return;
+  }
+  if (decision.action === "compact") {
+    away = undefined;
+    if (config.beforeCompactPrompt.trim()) {
+      await armBeforeCompact($, plan.key, config.beforeCompactPrompt, generation);
+      return;
+    }
+    await compactNow($, plan.key, "away");
+    return;
+  }
+  // The fork replays the main thread's last request with one line after it, so a hit reads the
+  // whole cached prefix and resets its TTL; neither the line nor the reply enters the transcript.
+  const reply = await $.model.fork({ prompt: KEEP_WARM_PROMPT });
+  if (away !== plan) return;
+  if (!reply.isAnswered || !cacheHeld(reply.usage)) {
+    away = undefined;
+    return;
+  }
+  plan.pings++;
+  scheduleAway($, seq, plan.delayMs);
+}
+
 /** The synchronous half of a turn end: count the exchange and run the cheap gates. */
 async function settle($: EngineInterface): Promise<void> {
-  const { context } = await $.session.usage();
+  const { context, rateLimits } = await $.session.usage();
   const now = await $.clock.now();
   const { key, state: stored } = await loadState($);
   const state = completeExchange(stored, context.tokens, now);
@@ -577,6 +734,7 @@ async function settle($: EngineInterface): Promise<void> {
     notice($, error instanceof Error ? error.message : "Cannot read compact-adviser settings.");
     return;
   }
+  await armAway($, config, key, now, rateLimits.length > 0);
   if (judging || !(await eligible($, config, state, context.tokens, now))) return;
   const epoch = generation;
   $.clock.after(0, () => {
@@ -754,7 +912,7 @@ async function changeMode($: EngineInterface, mode: Mode, fromPane = false): Pro
     if (!(await loadConsent($)).autoAcknowledged) {
       const confirmed = await confirm(
         $,
-        "Automatic mode persists across all Claude Code sessions and projects. Compaction is lossy and timing accuracy is not proven. It only acts at eligible checkpoints; it does not compact immediately. Enable experimental automatic compaction?",
+        "Automatic mode persists across all Claude Code sessions and projects. Compaction is lossy and timing accuracy is not proven. It acts at eligible checkpoints, and when you walk away from a settled answer it compacts a finished session before its prompt cache lapses, or keeps an unfinished session's prompt cache warm with a one-line background request on your model quota, up to the keep-warm hours. It does not compact immediately. Enable experimental automatic compaction?",
         "Enable automatic mode",
         "Auto mode",
         fromPane,
@@ -874,7 +1032,20 @@ async function statusText($: EngineInterface): Promise<string> {
       : "Waiting for fresh model usage.";
   const budget = config.contextBudgetTokens;
   const fraction = usageFraction(usage.context, budget);
-  return `Mode: ${config.mode}${config.mode === "auto" && !config.autoAcknowledged ? " (not confirmed)" : ""}. Judge: ${config.judge}. Minimum: ${formatTokens(config.minContextTokens)} tokens. Budget: ${budget > 0 ? `${formatTokens(budget)} tokens` : "off"}. Context: ${typeof tokens === "number" ? formatTokens(tokens) : "unknown"}${Number.isFinite(fraction) ? ` (${Math.round(fraction * 100)}% of the ${effectiveBudget(contextLimit(usage.context), budget) > 0 ? "budget" : "context limit"}; hint floor ${floorFor(fraction, parseProfile(config.profile, config.judge), config.judge).toFixed(2)})` : ""}. ${formatKeyStatus((await resolvedKey($, config.judge)).source)}. ${cooldown}${engine} Request log: ${config.logRequests ? await sessionLogPath($) : "off"}. Settings: /config (compact-adviser rows) and /compact-adviser.`;
+  const ttl = await engineCacheTtl($, usage.rateLimits.length > 0);
+  const awayMinutes = Math.round(idleDelayMs(ttl, config.idleMinutes) / 60_000);
+  const ttlLabel = !ttl.caching
+    ? "prompt caching off"
+    : config.idleMinutes > 0
+      ? "set by idleMinutes"
+      : ttl.known
+        ? `${ttl.ttlMs === SHORT_TTL_MS ? "5 min" : "1 h"} cache`
+        : "no cache TTL signal; 1 h assumed";
+  const awayText =
+    config.mode === "auto"
+      ? ` Away: after ${awayMinutes} min (${ttlLabel}), compact if finished, else keep-warm ${config.keepWarmHours > 0 && ttl.caching ? `up to ${config.keepWarmHours} h` : "off"}.`
+      : "";
+  return `Mode: ${config.mode}${config.mode === "auto" && !config.autoAcknowledged ? " (not confirmed)" : ""}. Judge: ${config.judge}. Minimum: ${formatTokens(config.minContextTokens)} tokens. Budget: ${budget > 0 ? `${formatTokens(budget)} tokens` : "off"}. Context: ${typeof tokens === "number" ? formatTokens(tokens) : "unknown"}${Number.isFinite(fraction) ? ` (${Math.round(fraction * 100)}% of the ${effectiveBudget(contextLimit(usage.context), budget) > 0 ? "budget" : "context limit"}; hint floor ${floorFor(fraction, parseProfile(config.profile, config.judge), config.judge).toFixed(2)})` : ""}. ${formatKeyStatus((await resolvedKey($, config.judge)).source)}. ${cooldown}${engine}${awayText} Request log: ${config.logRequests ? await sessionLogPath($) : "off"}. Settings: /config (compact-adviser rows) and /compact-adviser.`;
 }
 
 async function snoozeOrDismiss($: EngineInterface, command: "snooze" | "dismiss") {
@@ -906,6 +1077,7 @@ export const register: Register = (on, options) => {
     judging = false;
     compacting = false;
     hintVisible = false;
+    away = undefined;
     beforeCompact = undefined;
     abandonedTurn = undefined;
     abandonedDispatch = undefined;
@@ -934,6 +1106,7 @@ export const register: Register = (on, options) => {
   // Anyone's prompt or command but this module's own abandons a pending handoff, and the
   // turn it starts is never taken for the handoff's.
   on("prompt.submit", async ($, e, next) => {
+    cancelAway();
     if ((await isActivated($)) && !ownSubmission(e.origin)) {
       foreignSubmitted = true;
       if (beforeCompact) await abandonBeforeCompact($);
@@ -942,8 +1115,20 @@ export const register: Register = (on, options) => {
     return next(e);
   }).catch((_$, e, next) => next(e));
 
+  // Typing, a recalled entry, or a cleared box: the person is there, so nothing happens on
+  // their behalf. Kept cheap; these run on every edit.
+  on("prompt.edit", async (_$, e, next) => {
+    cancelAway();
+    return next(e);
+  });
+  on("prompt.change", async (_$, e, next) => {
+    cancelAway();
+    return next(e);
+  });
+
   on("command.run", async ($, e, next) => {
     if ((await isActivated($)) && !ownSubmission(e.origin)) {
+      cancelAway();
       foreignSubmitted = true;
       if (beforeCompact) await abandonBeforeCompact($);
       else abandonedDispatch = undefined;
@@ -952,6 +1137,7 @@ export const register: Register = (on, options) => {
   });
 
   on("turn.start", async ($, e, next) => {
+    cancelAway();
     if (await isActivated($)) {
       if (abandonedDispatch) {
         abandonedTurn = { turnId: e.turnId, key: abandonedDispatch.key };

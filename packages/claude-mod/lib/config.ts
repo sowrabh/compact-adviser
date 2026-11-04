@@ -24,6 +24,9 @@ export const PROFILE_KEY = `${PLUGIN}.profile`;
 export const BEFORE_COMPACT_PROMPT_KEY = `${PLUGIN}.beforeCompactPrompt`;
 export const API_KEY_KEY = `${PLUGIN}.typesafeApiKey`;
 export const OPENAI_API_KEY_KEY = `${PLUGIN}.openaiApiKey`;
+export const IDLE_MINUTES_KEY = `${PLUGIN}.idleMinutes`;
+export const KEEP_WARM_HOURS_KEY = `${PLUGIN}.keepWarmHours`;
+export const DEFAULT_KEEP_WARM_HOURS = 8;
 
 /** Each judge's saved-key row and the option name the module loaded it under. */
 export const SAVED_KEY: Readonly<
@@ -52,16 +55,24 @@ export interface Config {
   logRequests: boolean;
   /** Trimmed text run before automatic compaction; empty keeps compaction immediate. */
   beforeCompactPrompt: string;
+  /** Minutes after a settled answer before the walk-away decision; 0 follows the cache TTL. */
+  idleMinutes: number;
+  /** How long automatic mode may keep an unfinished session's cache warm; 0 turns it off. */
+  keepWarmHours: number;
   profile?: string;
 }
 
+/**
+ * Version 2 records an acknowledgement of automatic mode as it is now, walk-away compaction
+ * and keep-warm included; a version-1 acknowledgement predates both and does not count.
+ */
 export interface Consent {
-  version: 1;
+  version: 2;
   autoAcknowledged: boolean;
 }
 
 export const DEFAULT_CONSENT: Readonly<Consent> = Object.freeze({
-  version: 1,
+  version: 2,
   autoAcknowledged: false,
 });
 
@@ -123,14 +134,14 @@ export function parseConsent(value: unknown): Consent {
     !c ||
     typeof c !== "object" ||
     Array.isArray(c) ||
-    c.version !== 1 ||
+    (c.version !== 1 && c.version !== 2) ||
     typeof c.autoAcknowledged !== "boolean"
   ) {
     throw new SettingsError(
       "Invalid compact-adviser consent record; run /compact-adviser auto to restore it.",
     );
   }
-  return { version: 1, autoAcknowledged: c.autoAcknowledged };
+  return { version: 2, autoAcknowledged: c.version === 2 && c.autoAcknowledged };
 }
 
 export interface ConfigRowLike {
@@ -160,6 +171,8 @@ export function readConfig(
   const budget = row(BUDGET_KEY, "contextBudgetTokens") ?? 0;
   const logRequests = row(LOG_KEY, "logRequests");
   const beforeCompactPrompt = row(BEFORE_COMPACT_PROMPT_KEY, "beforeCompactPrompt") ?? "";
+  const idleMinutes = row(IDLE_MINUTES_KEY, "idleMinutes") ?? 0;
+  const keepWarmHours = row(KEEP_WARM_HOURS_KEY, "keepWarmHours") ?? DEFAULT_KEEP_WARM_HOURS;
   if (typeof mode !== "string" || !MODES.includes(mode as Mode)) {
     throw new SettingsError("Cannot read the compact-adviser mode setting; no action is taken.");
   }
@@ -186,6 +199,16 @@ export function readConfig(
       "Cannot read the compact-adviser before-compact prompt; no action is taken.",
     );
   }
+  if (typeof idleMinutes !== "number" || !Number.isFinite(idleMinutes) || idleMinutes < 0) {
+    throw new SettingsError(
+      "Cannot read the compact-adviser idle minutes setting; no action is taken.",
+    );
+  }
+  if (typeof keepWarmHours !== "number" || !Number.isFinite(keepWarmHours) || keepWarmHours < 0) {
+    throw new SettingsError(
+      "Cannot read the compact-adviser keep-warm hours setting; no action is taken.",
+    );
+  }
   const profile = row(PROFILE_KEY, "profile");
   parseProfile(profile, judge as JudgeName);
   const consent = parseConsent(consentValue);
@@ -197,6 +220,8 @@ export function readConfig(
     autoAcknowledged: consent.autoAcknowledged,
     logRequests: logRequests === true,
     beforeCompactPrompt: beforeCompactPrompt.trim(),
+    idleMinutes,
+    keepWarmHours,
     ...(profile !== undefined ? { profile: profile as string } : {}),
   };
 }

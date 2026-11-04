@@ -19,7 +19,7 @@
     "mode": {
       "type": "string",
       "title": "Mode",
-      "description": "hint shows advice; auto compacts at eligible checkpoints after a first-use confirmation from /compact-adviser; off disables the adviser (Claude Code's own auto-compact is unaffected).",
+      "description": "hint shows advice; auto compacts at eligible checkpoints and, once you walk away, compacts a finished session or keeps an unfinished session's prompt cache warm, after a first-use confirmation from /compact-adviser; off disables the adviser (Claude Code's own auto-compact is unaffected).",
       "options": [
         "hint",
         "auto",
@@ -68,6 +68,20 @@
       "title": "Before-compact prompt",
       "description": "Optional. Empty keeps automatic compaction immediate. In confirmed auto mode, a non-empty value runs as one turn, then compaction runs if that turn ends in a settled answer. A value that starts with / is a slash command (for example /stow); Claude Code does not expand slash commands or @file mentions in a plugin prompt, and it rejects a plugin prompt that starts with /. If you send your own prompt or run a command in between, or that turn is interrupted, errors, or does not finish within 5 minutes, nothing is compacted.",
       "default": ""
+    },
+    "idleMinutes": {
+      "type": "number",
+      "title": "Walk-away minutes",
+      "description": "Automatic mode only. Minutes after a settled answer, with no prompt, command or typing, before it compacts a finished session or keeps an unfinished one's prompt cache warm. 0 follows the cache TTL: 50 minutes on a 1-hour cache, 4 on a 5-minute cache, 50 when the TTL is unknown.",
+      "default": 0,
+      "min": 0
+    },
+    "keepWarmHours": {
+      "type": "number",
+      "title": "Keep-warm hours",
+      "description": "Automatic mode only. How long it keeps an unfinished session's prompt cache warm after you walk away, with a one-line background request on your model quota each cache cycle. It also stops once the pings would cost as much as one cache rebuild. 0 turns keep-warm off.",
+      "default": 8,
+      "min": 0
     },
     "typesafeApiKey": {
       "type": "string",

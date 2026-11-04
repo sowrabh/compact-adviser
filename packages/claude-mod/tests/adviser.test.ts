@@ -1735,3 +1735,239 @@ describe("settings pane", () => {
     );
   });
 });
+
+describe("walking away", () => {
+  const MINUTE = 60_000;
+  const acknowledged = { autoAcknowledged: true };
+  // Between the idle bar (0.5) and the turn-end floor at 36% usage (0.77): no compaction at
+  // the turn end, a compaction once the person has walked away.
+  const finishedCoordinating = jevAnswer({ completed: 0.99, handsOn: 0.2 });
+  const unfinished = jevAnswer({ completed: 0.3, handsOn: 0.99 });
+
+  function awayWorld(
+    on: Parameters<typeof world>[0],
+    answer: unknown,
+    options: Parameters<typeof world>[1] = {},
+  ) {
+    const w = world(on, { mode: "auto", consent: acknowledged, ...options });
+    w.respond = async () => ({ status: 200, text: JSON.stringify(answer) });
+    return w;
+  }
+
+  async function twoTurns($: Engine, w: World) {
+    w.messages = longConversation("first ask");
+    await turn($, w, "a");
+    w.messages = longConversation("second ask");
+    await turn($, w, "b");
+  }
+
+  test("a finished checkpoint compacts once at the idle point, without asking the judge again", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.compactions).toHaveLength(0);
+    expect(w.journal.requests).toHaveLength(1);
+    await w.clock.advance(50 * MINUTE - 1000);
+    expect(w.journal.compactions).toHaveLength(0);
+    await w.clock.advance(1000);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(w.journal.forks).toHaveLength(0);
+    await w.clock.advance(5 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+  });
+
+  test("a 5-minute cache moves the idle point to 4 minutes; idleMinutes overrides both", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating, { env: { FORCE_PROMPT_CACHING_5M: "1" } });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(4 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+  });
+
+  test("idleMinutes sets the idle point", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    w.rows.set(`${PLUGIN}.idleMinutes`, 20);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(20 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+  });
+
+  test("an unfinished checkpoint keeps the cache warm each cycle until the 8-hour cap", async ($, on) => {
+    const w = awayWorld(on, unfinished, { subscription: true } as never);
+    w.subscription = true;
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    for (let i = 0; i < 12; i++) {
+      await w.clock.advance(50 * MINUTE);
+      await drain(w);
+    }
+    // Pings at 50, 100, ... 450 minutes after the last answer; the next would pass 8 hours.
+    expect(w.journal.forks).toHaveLength(9);
+    expect(w.journal.forks.every((p) => p === "Reply with exactly: OK")).toBe(true);
+    expect(w.journal.compactions).toHaveLength(0);
+    expect(w.journal.requests).toHaveLength(2);
+    expect(w.journal.statuses.filter((s) => s)).toHaveLength(0);
+    expect(w.journal.toasts).toHaveLength(0);
+  });
+
+  test("keepWarmHours 0 turns warming off", async ($, on) => {
+    const w = awayWorld(on, unfinished);
+    w.rows.set(`${PLUGIN}.keepWarmHours`, 0);
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(3 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.forks).toHaveLength(0);
+  });
+
+  test("a ping that misses the cache stops warming", async ($, on) => {
+    const w = awayWorld(on, unfinished);
+    w.fork = async () => ({
+      isAnswered: true,
+      text: "OK",
+      usage: {
+        input_tokens: 16,
+        output_tokens: 4,
+        cache_read_input_tokens: 35000,
+        cache_creation_input_tokens: 40000,
+      },
+    });
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(4 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.forks).toHaveLength(1);
+  });
+
+  test("a fork with nothing to fork stops warming", async ($, on) => {
+    const w = awayWorld(on, unfinished);
+    w.fork = async () => ({ isAnswered: false, reason: "nothing-to-fork" });
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(4 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.forks).toHaveLength(1);
+  });
+
+  test("no ping before two exchanges", async ($, on) => {
+    const w = awayWorld(on, unfinished);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(3 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.forks).toHaveLength(0);
+    expect(w.journal.compactions).toHaveLength(0);
+  });
+
+  test("a judgment that failed at the turn end never compacts at the idle point", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    w.respond = async () => ({ status: 500, text: "{}" });
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(50 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(0);
+    expect(w.journal.forks).toHaveLength(1);
+  });
+
+  // Typing (`prompt.edit`) and a recalled or cleared box (`prompt.change`) are engine-only
+  // events the kit cannot raise; validate.mjs pins both hooks and scripts/live-e2e.mjs types.
+  for (const activity of ["a prompt", "a foreign command", "a turn"] as const) {
+    test(`${activity} before the idle point cancels it`, async ($, on) => {
+      const w = awayWorld(on, finishedCoordinating);
+      await $.session.start(interactiveStart);
+      await turnEnd($, w);
+      await w.clock.advance(10 * MINUTE);
+      if (activity === "a prompt") {
+        await $.prompt.submit({ text: "next ask", origin: { kind: "composer" } } as never);
+      } else if (activity === "a foreign command") {
+        await $.command.run(commandRun("status"));
+      } else {
+        await $.turn.start({ turnId: "next", origin: { kind: "composer" } } as never);
+      }
+      await w.clock.advance(60 * MINUTE);
+      await drain(w);
+      expect(w.journal.compactions).toHaveLength(0);
+      expect(w.journal.forks).toHaveLength(0);
+    });
+  }
+
+  test("a draft in the prompt box at the idle point counts as the person being there", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    w.draft = "half a thought";
+    await w.clock.advance(60 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(0);
+  });
+
+  for (const [name, options] of [
+    ["hint mode", { mode: "hint" }],
+    ["unconfirmed auto", { mode: "auto", consent: { autoAcknowledged: false } }],
+  ] as const) {
+    test(`${name} never acts once the person walks away`, async ($, on) => {
+      const w = world(on, options);
+      w.respond = async () => ({ status: 200, text: JSON.stringify(finishedCoordinating) });
+      await $.session.start(interactiveStart);
+      await twoTurns($, w);
+      await w.clock.advance(3 * 60 * MINUTE);
+      await drain(w);
+      expect(w.journal.compactions).toHaveLength(0);
+      expect(w.journal.forks).toHaveLength(0);
+    });
+  }
+
+  test("the before-compact prompt runs first at the idle point", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    w.rows.set(`${PLUGIN}.beforeCompactPrompt`, "Save the notes from this session.");
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(50 * MINUTE);
+    await drain(w);
+    expect(w.journal.prompts).toEqual(["Save the notes from this session."]);
+    expect(w.journal.compactions).toHaveLength(0);
+    await $.turn.start({ turnId: "before-1", text: "Notes saved." } as never);
+    await $.turn.complete({
+      answer: "Notes saved.",
+      durationMs: 1000,
+      isAborted: false,
+      turnId: "before-1",
+      reason: "answer",
+    });
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+  });
+
+  test("an acknowledgement saved before idle compaction existed asks again", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating, {
+      store: { preferences: { version: 1, autoAcknowledged: true } },
+      consent: "absent",
+    });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(60 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(0);
+    w.answers.push("Enable automatic mode");
+    await $.command.run(commandRun("auto"));
+    expect(w.journal.asks.at(-1)).toContain("walk away");
+    expect(w.journal.asks.at(-1)).toContain("prompt cache warm");
+  });
+
+  test("status says what happens once you walk away", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    w.subscription = true;
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await $.command.run(commandRun("status"));
+    expect(w.journal.logs.at(-1)).toContain("Away: after 50 min (1 h cache)");
+    expect(w.journal.logs.at(-1)).toContain("keep-warm up to 8 h");
+  });
+});

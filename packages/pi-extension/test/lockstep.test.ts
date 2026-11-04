@@ -744,3 +744,23 @@ test("every package writes the same Decisions log lines", () => {
     );
   }
 });
+
+test("every package scrubs the saved OpenAI key field the same way as the TypeSafe one", () => {
+  const secret = "sk-saved-openai-key-must-not-leave";
+  const dump = JSON.stringify({
+    judge: "decisions",
+    openaiApiKey: secret,
+    "compact-adviser.openaiApiKey": secret,
+  });
+  const loose = `openaiApiKey=${secret} and "compact-adviser.openaiApiKey": "${secret}"`;
+  for (const other of [claudeSnapshot, codexSnapshot, grokSnapshot]) {
+    assert.deepEqual(other.redactOwnedSettings(dump), piContext.redactOwnedSettings(dump));
+    assert.deepEqual(other.redactOwnedSettings(loose), piContext.redactOwnedSettings(loose));
+  }
+  for (const text of [dump, loose]) {
+    const clean = piContext.redactOwnedSettings(text);
+    assert.equal(clean.redacted, true);
+    assert.ok(!clean.text.includes(secret));
+  }
+  assert.ok(piContext.redactOwnedSettings(dump).text.includes("decisions"));
+});

@@ -1,14 +1,17 @@
-// TYPESAFE_API_KEY from the hook environment, else the key saved in settings, else a cwd .env file.
+// A judge's API key (OPENAI_DECISIONS_API_KEY or TYPESAFE_API_KEY) from the hook environment,
+// else the key saved in settings, else a cwd .env file.
 // KEY=VALUE lines: last assignment wins; comments and blanks are ignored.
 // Optional `export` / `declare -x` prefixes and one matching quote layer.
 
 const PREFIX = /^(?:export|declare\s+-x)\s+/;
 
-export type TypesafeKeySource = "env" | "saved" | ".env" | "missing";
-export interface ResolvedTypesafeApiKey {
+export type KeySource = "env" | "saved" | ".env" | "missing";
+export interface ResolvedApiKey {
   value: string | undefined;
-  source: TypesafeKeySource;
+  source: KeySource;
 }
+export type TypesafeKeySource = KeySource;
+export type ResolvedTypesafeApiKey = ResolvedApiKey;
 
 function unquote(value: string): string {
   if (value.length >= 2) {
@@ -55,6 +58,9 @@ export function resolveTypesafeApiKey(
   return { value: undefined, source: "missing" };
 }
 
-export function formatKeyStatus(source: TypesafeKeySource): string {
+export function formatKeyStatus(source: KeySource): string {
   return `Key: ${source}`;
 }
+
+/** Either judge's key, from the values its caller read under that judge's variable name. */
+export const resolveApiKey = resolveTypesafeApiKey;

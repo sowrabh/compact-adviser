@@ -1,3 +1,5 @@
+import type { JudgeName } from "./judge.ts";
+
 /** A bounded, data-only override. Missing or empty settings preserve shipped defaults. */
 export interface ProfileQuestions {
   done: {
@@ -45,7 +47,11 @@ function question(value: unknown, choices: string[]): boolean {
   );
 }
 
-export function parseProfile(setting: unknown): JudgeProfile | undefined {
+/**
+ * Parses the `profile` setting. Its `questions` are Jev's choice questions, so a profile that
+ * carries them is refused while the Decisions judge is selected: they are never sent there.
+ */
+export function parseProfile(setting: unknown, judge: JudgeName = "jev"): JudgeProfile | undefined {
   if (setting === undefined || setting === "") return undefined;
   const error = () =>
     new Error(
@@ -99,5 +105,10 @@ export function parseProfile(setting: unknown): JudgeProfile | undefined {
       !question(value.questions.shape, ["hands_on", "coordinating", "unclear"]))
   )
     throw error();
+  if (judge === "decisions" && value.questions !== undefined) {
+    throw new Error(
+      "The compact-adviser profile sets questions, which apply to the jev judge only; advice is disabled. Remove questions from the profile or set the judge to jev.",
+    );
+  }
   return value as unknown as JudgeProfile;
 }

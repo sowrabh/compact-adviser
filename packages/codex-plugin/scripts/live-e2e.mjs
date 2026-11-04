@@ -2,8 +2,8 @@
 //
 // Codex runs with an isolated CODEX_HOME, this package installed the way a user installs it
 // (a marketplace source plus `codex plugin add`), a deterministic local stand-in for the model
-// provider, and a local TypeSafe fixture reached through the plugin's loopback-only
-// COMPACT_ADVISER_TEST_ENDPOINT. No account credential, model quota, or real TypeSafe request
+// provider, and a local judge fixture reached through the plugin's loopback-only
+// COMPACT_ADVISER_TEST_ENDPOINT. No account credential, model quota, or real judge request
 // is used, and no user configuration is read or written.
 //
 // It proves:
@@ -36,6 +36,7 @@ const REPO = resolve(PACKAGE, "..", "..");
 const CODEX = process.env.COMPACT_TEST_CODEX_BIN || "codex";
 const HINT = "Compact adviser: work appears completed or recorded. Run /compact to save tokens.";
 const TYPESAFE_KEY = "tsk-live-fixture-key";
+const OPENAI_KEY = "sk-live-fixture-openai-key";
 const SOCKET = `compact-adviser-codex-e2e-${process.pid}`;
 const SESSION = "e2e";
 
@@ -44,13 +45,27 @@ const home = join(lab, "codex-home");
 const project = join(lab, "project");
 mkdirSync(home, { recursive: true });
 mkdirSync(project, { recursive: true });
-writeFileSync(join(project, ".env"), `TYPESAFE_API_KEY=${TYPESAFE_KEY}\n`);
+writeFileSync(
+  join(project, ".env"),
+  `TYPESAFE_API_KEY=${TYPESAFE_KEY}\nOPENAI_DECISIONS_API_KEY=${OPENAI_KEY}\n`,
+);
 
 const version = run([CODEX, "--version"]).stdout.trim();
 
 // --- Local servers -------------------------------------------------------------------
 const jevRequests = [];
 let modelRequests = 0;
+
+function decisionsAnswer() {
+  return {
+    model: "gpt-6-luna",
+    answers: [
+      { type: "predicate", name: "finished", probability: 0.99 },
+      { type: "predicate", name: "hands_on", probability: 0.99 },
+    ],
+    usage: { input_tokens: 8200, output_tokens: 0 },
+  };
+}
 
 function jevAnswer() {
   const choice = (name, p, others) => ({
@@ -92,7 +107,7 @@ const server = createServer((request, response) => {
     if (request.url.startsWith("/v1/systemone")) {
       jevRequests.push({ authorization: request.headers.authorization, body });
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(jevAnswer()));
+      response.end(JSON.stringify(body.model === "gpt-6-luna" ? decisionsAnswer() : jevAnswer()));
       return;
     }
     if (!request.url.includes("/responses")) {
@@ -351,7 +366,9 @@ try {
   if (exec.status !== 0) throw new Error(`[${step}] codex exec failed: ${exec.stderr}`);
   if (exec.stdout.includes(HINT)) throw new Error(`[${step}] a scripted run showed the hint`);
   if (jevRequests.length !== before) {
-    throw new Error(`[${step}] a scripted run asked TypeSafe ${jevRequests.length - before} times`);
+    throw new Error(
+      `[${step}] a scripted run asked the judge ${jevRequests.length - before} times`,
+    );
   }
   pass("codex exec settles the same shape without judging: scripted runs never advise");
 
@@ -380,14 +397,15 @@ try {
     throw new Error(`[${step}] expected one '↳ Hook ·' hint line\n${shot}`);
   }
   if (jevRequests.length !== 1) {
-    throw new Error(`[${step}] expected one TypeSafe request, saw ${jevRequests.length}`);
+    throw new Error(`[${step}] expected one judge request, saw ${jevRequests.length}`);
   }
   const [request] = jevRequests;
-  if (request.authorization !== `Bearer ${TYPESAFE_KEY}` || request.body.model !== "jev-latest") {
-    throw new Error(`[${step}] unexpected TypeSafe request ${JSON.stringify(request.body.model)}`);
+  // The default judge: OpenAI's Decisions API with its own key.
+  if (request.authorization !== `Bearer ${OPENAI_KEY}` || request.body.model !== "gpt-6-luna") {
+    throw new Error(`[${step}] unexpected judge request ${JSON.stringify(request.body.model)}`);
   }
-  if (JSON.stringify(request.body).includes(TYPESAFE_KEY)) {
-    throw new Error(`[${step}] the key leaked into the body`);
+  if ([OPENAI_KEY, TYPESAFE_KEY].some((key) => JSON.stringify(request.body).includes(key))) {
+    throw new Error(`[${step}] a key leaked into the body`);
   }
   const log = requestLog();
   const [loggedRequest, loggedResponse] = log.lines;
@@ -396,16 +414,17 @@ try {
     loggedRequest.kind !== "request" ||
     loggedResponse.kind !== "response" ||
     loggedResponse.id !== loggedRequest.id ||
-    loggedResponse.answers?.done?.choice !== "finished" ||
-    loggedResponse.answers?.shape?.choice !== "hands_on" ||
+    loggedResponse.judge !== "decisions" ||
+    typeof loggedResponse.answers?.finished !== "number" ||
+    typeof loggedResponse.answers?.hands_on !== "number" ||
     typeof loggedResponse.score !== "number" ||
     typeof loggedResponse.floor !== "number" ||
     loggedResponse.qualifies !== true
   ) {
     throw new Error(`[${step}] Jev decision log is incomplete: ${JSON.stringify(log.lines)}`);
   }
-  if (log.raw.includes(TYPESAFE_KEY)) {
-    throw new Error(`[${step}] the TypeSafe key leaked into the request log`);
+  if ([OPENAI_KEY, TYPESAFE_KEY].some((key) => log.raw.includes(key))) {
+    throw new Error(`[${step}] a key leaked into the request log`);
   }
   pass(
     "a settled 70,000-token exchange is judged once, paints the ↳ Hook hint, and logs its complete Jev decision without the key",

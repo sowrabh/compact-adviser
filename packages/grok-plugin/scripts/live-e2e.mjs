@@ -3,8 +3,8 @@
 // Grok runs with an isolated GROK_HOME, this package installed the way a person installs it
 // (`grok plugin install --trust`) and its hooks registered by `compact-adviser install`, a
 // deterministic local stand-in for the xAI Responses API (`--xai-api-base-url`), and a local
-// TypeSafe fixture reached through the plugin's loopback-only COMPACT_ADVISER_TEST_ENDPOINT.
-// No account credential, model quota, or real TypeSafe request is used, and no user
+// judge fixture reached through the plugin's loopback-only COMPACT_ADVISER_TEST_ENDPOINT.
+// No account credential, model quota, or real judge request is used, and no user
 // configuration is read or written.
 //
 // Grok 1.0.34 lists a plugin's own hooks.json but never loads it into a session, which is why
@@ -20,8 +20,8 @@
 //   3. The status-line launcher, fed a real status-line payload, paints the built-in segments
 //      and the hint.
 //   4. The plugin itself is installed, enabled, and its /compact-adviser command discoverable.
-//   5. With mode off the same turn asks TypeSafe nothing.
-//   6. With the session kill switch set, a real turn asks TypeSafe nothing and paints no hint.
+//   5. With mode off the same turn asks the judge nothing.
+//   6. With the session kill switch set, a real turn asks the judge nothing and paints no hint.
 //
 // COMPACT_TEST_KEEP_LAB=1 keeps the lab directory for inspection.
 
@@ -35,6 +35,7 @@ const PACKAGE = join(import.meta.dirname, "..");
 const GROK = process.env.COMPACT_TEST_GROK_BIN ?? "grok";
 const HINT = "Compact adviser: work appears completed or recorded. Run /compact to save tokens.";
 const TYPESAFE_KEY = "tsk-live-fixture-key";
+const OPENAI_KEY = "sk-live-fixture-openai-key";
 const version = execFileSync(GROK, ["--version"], { encoding: "utf8" }).trim();
 
 const lab = mkdtempSync(join(tmpdir(), "compact-adviser-grok-e2e-"));
@@ -177,6 +178,19 @@ const typesafe = createServer((request, response) => {
       probabilities: { [name]: p, [others[0]]: (1 - p) / 2, [others[1]]: (1 - p) / 2 },
     });
     response.writeHead(200, { "content-type": "application/json" });
+    if (JSON.parse(body || "{}").model === "gpt-6-luna") {
+      response.end(
+        JSON.stringify({
+          model: "gpt-6-luna",
+          answers: [
+            { type: "predicate", name: "finished", probability: 0.97 },
+            { type: "predicate", name: "hands_on", probability: 0.96 },
+          ],
+          usage: { input_tokens: 8200, output_tokens: 0 },
+        }),
+      );
+      return;
+    }
     response.end(
       JSON.stringify({
         model: "jev-1.13.0",
@@ -201,6 +215,7 @@ function agentEnv() {
     GROK_HOME: home,
     XAI_API_KEY: "xai-fixture-key-not-real",
     TYPESAFE_API_KEY: TYPESAFE_KEY,
+    OPENAI_DECISIONS_API_KEY: OPENAI_KEY,
     COMPACT_ADVISER_TEST_ENDPOINT: typesafeUrl,
     NO_COLOR: "1",
   };
@@ -344,16 +359,19 @@ try {
   );
   check(
     jevRequests.length === 1,
-    `the Stop gate asked TypeSafe once (asked ${jevRequests.length})`,
+    `the Stop gate asked the judge once (asked ${jevRequests.length})`,
   );
   const request = JSON.parse(jevRequests[0] ?? "{}");
+  // The default judge, OpenAI's Decisions API, reads the snapshot as JSON evidence.
+  const judged = request.input?.[0]?.content?.find((part) => part.type === "input_json")?.data;
+  check(request.model === "gpt-6-luna", "the default Decisions judge was asked");
   check(
-    (request.state?.recent ?? []).some((entry) => entry.text?.includes("is committed")),
+    (judged?.recent ?? []).some((entry) => entry.text?.includes("is committed")),
     "the judge read the answer Grok actually wrote to the transcript",
   );
   check(
-    !JSON.stringify(request).includes(TYPESAFE_KEY),
-    "the request body carries no TypeSafe key",
+    ![OPENAI_KEY, TYPESAFE_KEY].some((key) => JSON.stringify(request).includes(key)),
+    "the request body carries no key",
   );
   const verdict = join(dataDir, "verdicts", `${sessionId}.json`);
   check(existsSync(verdict), "the qualifying checkpoint recorded a verdict", verdict);
@@ -388,14 +406,14 @@ try {
 
   cli(["mode", "off"]);
   await runTurn("Say again that everything is committed and nothing is pending.");
-  check(jevRequests.length === 1, "mode off asks TypeSafe nothing");
+  check(jevRequests.length === 1, "mode off asks the judge nothing");
 
   cli(["mode", "hint"]);
   const disabledSessionId = await runTurn(
     "Say once more that everything is committed and nothing is pending.",
     { COMPACT_ADVISER_DISABLE: "1" },
   );
-  check(jevRequests.length === 1, "the disabled real turn asks TypeSafe nothing");
+  check(jevRequests.length === 1, "the disabled real turn asks the judge nothing");
   const disabledRow = execFileSync(join(dataDir, "status-line.sh"), [], {
     encoding: "utf8",
     input: JSON.stringify({ ...JSON.parse(payload), session_id: disabledSessionId }),

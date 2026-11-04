@@ -2,9 +2,9 @@
 //
 // Claude Code runs with an isolated configuration directory, this package loaded through
 // --plugin-dir, a deterministic local stand-in for the Anthropic Messages API
-// (ANTHROPIC_BASE_URL), and a local TypeSafe fixture reached through the mod's
+// (ANTHROPIC_BASE_URL), and a local judge fixture reached through the mod's
 // loopback-only COMPACT_ADVISER_TEST_ENDPOINT. No account credential, model quota, or
-// real TypeSafe request is used, and no user configuration is read or written.
+// real judge request is used, and no user configuration is read or written.
 //
 // It proves:
 //   1. With CLAUDE_CODE_ENABLE_FUNCTION_HOOKS unset the mod is inert: no status strip and no
@@ -39,6 +39,7 @@ import { CLAUDE, claudeEnv, claudeVersion, PACKAGE } from "./common.mjs";
 const HINT = "work appears completed or recorded. Run /compact to save tokens.";
 const API_KEY = "sk-ant-fixture-not-a-real-key-0000000000";
 const TYPESAFE_KEY = "tsk-live-fixture-key";
+const OPENAI_KEY = "sk-live-fixture-openai-key";
 const SOCKET = `compact-adviser-e2e-${process.pid}`;
 const SESSION = "e2e";
 const version = claudeVersion();
@@ -47,7 +48,10 @@ const config = join(lab, "config");
 const project = join(lab, "project");
 mkdirSync(config, { recursive: true });
 mkdirSync(project, { recursive: true });
-writeFileSync(join(project, ".env"), `TYPESAFE_API_KEY=${TYPESAFE_KEY}\n`);
+writeFileSync(
+  join(project, ".env"),
+  `TYPESAFE_API_KEY=${TYPESAFE_KEY}\nOPENAI_DECISIONS_API_KEY=${OPENAI_KEY}\n`,
+);
 const MARKER = join(project, "before-compact-marker.txt");
 const MARKER_BODY = "MARKER_SKILL_E2E write before-compact-marker.txt";
 mkdirSync(join(project, ".claude", "skills", "marker"), { recursive: true });
@@ -84,6 +88,17 @@ function jevAnswer() {
       shape: choice("hands_on", verdict.handsOn, ["coordinating", "unclear"]),
     },
     usage: { input_tokens: 2500, output_tokens: 0 },
+  };
+}
+
+function decisionsAnswer() {
+  return {
+    model: "gpt-6-luna",
+    answers: [
+      { type: "predicate", name: "finished", probability: verdict.completed },
+      { type: "predicate", name: "hands_on", probability: verdict.handsOn },
+    ],
+    usage: { input_tokens: 8200, output_tokens: 0 },
   };
 }
 
@@ -185,7 +200,7 @@ const server = createServer((req, res) => {
       if (req.url.startsWith("/v1/systemone")) {
         jevRequests.push({ authorization: req.headers.authorization, body });
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(jevAnswer()));
+        res.end(JSON.stringify(body.model === "gpt-6-luna" ? decisionsAnswer() : jevAnswer()));
       } else if (req.url.startsWith("/v1/messages/count_tokens")) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ input_tokens: 1000 }));
@@ -353,7 +368,7 @@ try {
   await command("/compact-adviser");
   await waitText("Minimum context         40,000 tokens");
   await waitText("Reset minimum to 40,000");
-  await waitText("TypeSafe API key        from .env");
+  await waitText("OpenAI API key          from .env");
   if (screen().includes("TypeSafe sharing")) {
     throw new Error(`[${step}] sharing toggle still present\n${screen()}`);
   }
@@ -419,26 +434,27 @@ try {
   }
 
   step = "request logging";
-  await moveTo("Log TypeSafe requests");
+  await moveTo("Log OpenAI requests");
   key("Enter");
-  await waitText("› Log TypeSafe requests");
+  await waitText("› Log OpenAI requests");
   await waitText("● Off (default)");
   await moveTo("On");
   key("Enter");
-  await waitText("TypeSafe request logging on (all sessions)", 20000);
+  // Claude Code 2.1.318 no longer draws a toast over an open pane, so the saved option and the
+  // redrawn row are the evidence; 2.1.275 also showed the confirmation toast here.
   await waitFor(() => pluginOptions().logRequests === true, "the host to enable request logging");
-  await waitText("Log TypeSafe requests   On");
+  await waitText("Log OpenAI requests     On");
   pass("request logging is enabled by arrows and Enter alone through the real settings pane");
 
   step = "escape back";
   // After the save the ring is back on the row that was opened; Escape inside a view returns
   // to the list with the keyboard, and the list then closes on Escape.
-  await moveTo("Log TypeSafe requests");
+  await moveTo("Log OpenAI requests");
   key("Enter");
   await waitText("● On");
   key("Escape");
   await waitText("↑↓ move · Enter select · Esc close");
-  await moveTo("Log TypeSafe requests", "Up");
+  await moveTo("Log OpenAI requests", "Up");
   pass("Escape in a view returns to the list, keeping the keyboard and the row");
 
   step = "pane minimum";
@@ -475,15 +491,16 @@ try {
     throw new Error(`[${step}] expected one host-highlighted status line\n${hintShot}`);
   }
   if (jevRequests.length !== 1)
-    throw new Error(`[${step}] expected one TypeSafe request, saw ${jevRequests.length}`);
+    throw new Error(`[${step}] expected one judge request, saw ${jevRequests.length}`);
   const request = jevRequests[0];
-  if (request.authorization !== `Bearer ${TYPESAFE_KEY}` || request.body.model !== "jev-latest") {
+  // The default judge: OpenAI's Decisions API with its own key.
+  if (request.authorization !== `Bearer ${OPENAI_KEY}` || request.body.model !== "gpt-6-luna") {
     throw new Error(
-      `[${step}] unexpected TypeSafe request ${JSON.stringify({ ...request, body: request.body.model })}`,
+      `[${step}] unexpected judge request ${JSON.stringify({ ...request, body: request.body.model })}`,
     );
   }
-  if (JSON.stringify(request.body).includes(TYPESAFE_KEY))
-    throw new Error(`[${step}] the key leaked into the body`);
+  if ([OPENAI_KEY, TYPESAFE_KEY].some((key) => JSON.stringify(request.body).includes(key)))
+    throw new Error(`[${step}] a key leaked into the body`);
   const logDir = join(lab, ".claude");
   const logNames = readdirSync(logDir).filter(
     (name) => name.startsWith("compact-adviser-requests-") && name.endsWith(".jsonl"),
@@ -500,21 +517,22 @@ try {
   const [loggedRequest, loggedResponse] = logLines;
   if (
     loggedResponse.id !== loggedRequest.id ||
-    loggedResponse.answers?.done?.choice !== "finished" ||
-    loggedResponse.answers?.shape?.choice !== "hands_on" ||
+    loggedResponse.judge !== "decisions" ||
+    typeof loggedResponse.answers?.finished !== "number" ||
+    typeof loggedResponse.answers?.hands_on !== "number" ||
     typeof loggedResponse.score !== "number" ||
     typeof loggedResponse.usage !== "number" ||
     typeof loggedResponse.floor !== "number" ||
     loggedResponse.qualifies !== true
   ) {
-    throw new Error(`[${step}] Jev decision log is incomplete: ${JSON.stringify(loggedResponse)}`);
+    throw new Error(`[${step}] Decisions log is incomplete: ${JSON.stringify(loggedResponse)}`);
   }
-  if (readFileSync(requestLog, "utf8").includes(TYPESAFE_KEY))
-    throw new Error(`[${step}] the TypeSafe key leaked into the request log`);
+  if ([OPENAI_KEY, TYPESAFE_KEY].some((key) => readFileSync(requestLog, "utf8").includes(key)))
+    throw new Error(`[${step}] a key leaked into the request log`);
   if (process.env.COMPACT_TEST_LOG_EVIDENCE)
     copyFileSync(requestLog, process.env.COMPACT_TEST_LOG_EVIDENCE);
   pass(
-    "a settled 70,000-token exchange is judged once, shows the hint, and logs its complete Jev decision without the key",
+    "a settled 70,000-token exchange is judged once by the Decisions judge, shows the hint, and logs its complete decision without a key",
   );
 
   step = "back-to-back hints";

@@ -63,6 +63,7 @@ test("a stored profile controls the real hook verdict", async (t) => {
     join(l.dataDir, "settings.json"),
     JSON.stringify({
       version: 1,
+      judge: "jev",
       profile: JSON.stringify({ version: 1, coordinationWeight: 1, floors: [[0, 1]] }),
     }),
   );
@@ -83,7 +84,10 @@ test("a profile that turns invalid while the judge is pending retires the hint a
   writeFileSync(statePath, JSON.stringify({ ...seeded, failures: 3 }));
   writeHistory(l, [...workedHistory("one"), ...workedHistory("two").slice(1)]);
   fixture.onRequest = () =>
-    writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"profile":"not a profile"}');
+    writeFileSync(
+      join(l.dataDir, "settings.json"),
+      '{"version":1,"judge":"jev","profile":"not a profile"}',
+    );
   await runCli(["hook", "stop"], {
     lab: l,
     stdin: stopPayload(l, { promptId: "prompt-2" }),
@@ -599,6 +603,7 @@ test("COMPACT_ADVISER_DISABLE hides an already earned hint", async (t) => {
 
 test("install reports a launcher write failure instead of succeeding", async (t) => {
   const l = lab(t);
+  rmSync(l.dataDir, { recursive: true, force: true });
   writeFileSync(l.dataDir, "not a directory");
   const installed = await runCli(["install"], { lab: l });
   assert.notEqual(installed.code, 0);
@@ -607,6 +612,7 @@ test("install reports a launcher write failure instead of succeeding", async (t)
 
 test("session start stays silent when launchers cannot be written", async (t) => {
   const l = lab(t);
+  rmSync(l.dataDir, { recursive: true, force: true });
   writeFileSync(l.dataDir, "not a directory");
   const start = await runCli(["hook", "session-start"], {
     lab: l,
@@ -614,4 +620,68 @@ test("session start stays silent when launchers cannot be written", async (t) =>
   });
   assert.equal(start.code, 0);
   assert.equal(start.stdout, "");
+});
+
+test("Decisions is the default judge: its own key and two predicates", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1}');
+  await runCli(["hook", "stop"], {
+    lab: l,
+    stdin: stopPayload(l),
+    env: {
+      COMPACT_ADVISER_TEST_ENDPOINT: fixture.url,
+      TYPESAFE_API_KEY: "tsk-test-key",
+      OPENAI_DECISIONS_API_KEY: "sk-openai-test-key",
+    },
+  });
+  assert.equal(fixture.bodies.length, 1);
+  const body = JSON.parse(fixture.bodies[0] ?? "{}") as {
+    model: string;
+    questions: { name: string }[];
+  };
+  assert.equal(body.model, "gpt-6-luna");
+  assert.deepEqual(
+    body.questions.map((q) => q.name),
+    ["finished", "hands_on"],
+  );
+  for (const secret of ["sk-openai-test-key", "tsk-test-key"])
+    assert.ok(!(fixture.bodies[0] ?? "").includes(secret));
+  const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
+  assert.ok(row.stdout.includes(HINT));
+});
+
+test("no substitution: Decisions without its key asks nobody, even with a TypeSafe key", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"judge":"decisions"}');
+  await runCli(["hook", "stop"], { lab: l, stdin: stopPayload(l), env: keyed(fixture) });
+  assert.equal(fixture.bodies.length, 0);
+});
+
+test("a Decisions refusal shows no hint", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"judge":"decisions"}');
+  fixture.refuse = true;
+  await runCli(["hook", "stop"], {
+    lab: l,
+    stdin: stopPayload(l),
+    env: {
+      COMPACT_ADVISER_TEST_ENDPOINT: fixture.url,
+      OPENAI_DECISIONS_API_KEY: "sk-openai-test-key",
+    },
+  });
+  assert.equal(fixture.bodies.length, 1);
+  const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
+  assert.ok(!row.stdout.includes(HINT));
+});
+
+test("the shell CLI saves the judge, refuses others, and status names it", async (t) => {
+  const l = lab(t);
+  assert.match(
+    (await runCli(["judge", "decisions"], { lab: l })).stdout,
+    /Judge saved: OpenAI Decisions/,
+  );
+  const refused = await runCli(["judge", "gemini"], { lab: l });
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /decisions or jev/);
+  assert.match((await runCli(["status"], { lab: l })).stdout, /Judge: decisions\./);
 });

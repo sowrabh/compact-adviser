@@ -18,6 +18,7 @@ export const MAX_SAVED_API_KEY_LENGTH = 1024;
 /** The built-in status-line segments this package paints in place of Grok's own row. */
 export const STATUS_LINE_ITEMS = ["cwd", "model", "context"] as const;
 
+import { DEFAULT_JUDGE, JUDGES, type JudgeName } from "./judge.ts";
 import { parseProfile } from "./profile.ts";
 
 export interface Settings {
@@ -27,9 +28,35 @@ export interface Settings {
   /** Tokens at which the hint floor is fully relaxed; 0 uses the model's window. */
   contextBudgetTokens: number;
   logRequests: boolean;
+  /** Which model answers the two questions; absent means the Decisions judge. */
+  judge?: JudgeName;
   /** Saved TypeSafe key; a non-empty `TYPESAFE_API_KEY` in the environment still wins. */
   typesafeApiKey: string;
+  /** Saved OpenAI key; a non-empty `OPENAI_DECISIONS_API_KEY` in the environment still wins. */
+  openaiApiKey?: string;
   profile?: string;
+}
+
+/** The judge the settings select. */
+export function selectedJudge(settings: Settings): JudgeName {
+  return settings.judge ?? DEFAULT_JUDGE;
+}
+
+/** Each judge's saved-key field and the words messages use for it. */
+export const SAVED_KEY: Readonly<
+  Record<JudgeName, { field: "openaiApiKey" | "typesafeApiKey"; label: string; article: string }>
+> = {
+  decisions: { field: "openaiApiKey", label: "OpenAI API key", article: "an" },
+  jev: { field: "typesafeApiKey", label: "TypeSafe API key", article: "a" },
+};
+
+/** A judge name, or the reason it is not one. */
+export function parseJudge(text: string): JudgeName {
+  const value = text.trim();
+  if (!JUDGES.includes(value as JudgeName)) {
+    throw new SettingsError("Choose a judge: decisions or jev.");
+  }
+  return value as JudgeName;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -79,11 +106,12 @@ export function parseMode(text: string): Mode {
   return value as Mode;
 }
 
-export function parseSavedApiKey(text: string): string {
+export function parseSavedApiKey(text: string, judge: JudgeName = "jev"): string {
   const value = text.trim();
-  if (!value) throw new SettingsError("Enter a TypeSafe API key, or clear it with `key clear`.");
+  const { label, article } = SAVED_KEY[judge];
+  if (!value) throw new SettingsError(`Enter ${article} ${label}, or clear it with \`key clear\`.`);
   if (value.length > MAX_SAVED_API_KEY_LENGTH) {
-    throw new SettingsError("That value is too long to save as a TypeSafe API key.");
+    throw new SettingsError(`That value is too long to save as ${article} ${label}.`);
   }
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
@@ -132,7 +160,17 @@ export function parseSettings(value: unknown): Settings {
       "Cannot read the compact-adviser TypeSafe key setting; no action is taken.",
     );
   }
-  parseProfile(s.profile);
+  const openaiKey = s.openaiApiKey ?? "";
+  if (typeof openaiKey !== "string") {
+    throw new SettingsError(
+      "Cannot read the compact-adviser OpenAI key setting; no action is taken.",
+    );
+  }
+  const judge = s.judge;
+  if (judge !== undefined && !JUDGES.includes(judge as JudgeName)) {
+    throw new SettingsError("Cannot read the compact-adviser judge setting; no action is taken.");
+  }
+  parseProfile(s.profile, judge ?? DEFAULT_JUDGE);
   return {
     version: 1,
     mode: mode as Mode,
@@ -140,7 +178,9 @@ export function parseSettings(value: unknown): Settings {
     minContextTokens: minimum,
     contextBudgetTokens: budget,
     logRequests,
+    ...(judge !== undefined ? { judge } : {}),
     typesafeApiKey: key,
+    ...(openaiKey !== "" ? { openaiApiKey: openaiKey } : {}),
   };
 }
 

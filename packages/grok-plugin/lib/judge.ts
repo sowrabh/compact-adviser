@@ -57,6 +57,14 @@ export function typesafeEndpoint(base: string | undefined): string | undefined {
 export const MAX_REQUEST_BYTES = 32000;
 export const MAX_RESPONSE_BYTES = 32768;
 export const TIMEOUT_MS = 2000;
+/**
+ * How long each judge may take. Jev keeps upstream's 2 s. A Decisions call measured 0.2-0.9 s
+ * warm but over 1 s on a cold connection, and a hook process starts cold every time.
+ */
+export const JUDGE_TIMEOUT_MS: Readonly<Record<JudgeName, number>> = {
+  decisions: 5000,
+  jev: TIMEOUT_MS,
+};
 
 /**
  * Two atomic questions in one request, composed in code.
@@ -530,7 +538,7 @@ async function send(
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
         body,
       }),
-      transport.sleep(TIMEOUT_MS).then((): typeof TIMED_OUT => TIMED_OUT),
+      transport.sleep(JUDGE_TIMEOUT_MS[judge]).then((): typeof TIMED_OUT => TIMED_OUT),
     ]);
   } catch (cause) {
     throw new JudgeError("network", { cause, judge });

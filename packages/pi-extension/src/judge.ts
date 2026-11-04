@@ -50,6 +50,14 @@ export function typesafeEndpoint(base: string | undefined): string | undefined {
 }
 export const MAX_REQUEST_BYTES = 32000;
 /**
+ * How long each judge may take. Jev keeps upstream's 2 s. A Decisions call measured 0.2-0.9 s
+ * warm but over 1 s on a cold connection, and a hook process starts cold every time.
+ */
+export const JUDGE_TIMEOUT_MS: Readonly<Record<JudgeName, number>> = {
+  decisions: 5000,
+  jev: 2000,
+};
+/**
  * Two atomic questions in one request, composed in code.
  *
  * `done` asks whether the assistant's own latest unit of work is finished;
@@ -570,7 +578,7 @@ export async function decide(
   key: string,
   signal: AbortSignal,
   transport: typeof fetch = fetch,
-  timeoutMs = 2000,
+  timeoutMs = JUDGE_TIMEOUT_MS.decisions,
   endpoint = DECISIONS_ENDPOINT,
 ): Promise<DecisionsJudgment> {
   const reply = await send(

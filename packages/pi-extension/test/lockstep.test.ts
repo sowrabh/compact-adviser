@@ -775,3 +775,22 @@ test("Pi and Claude Code place the walk-away point the same way for the same cac
     }
   }
 });
+
+test("each judge has its own timeout: Jev keeps 2 s, Decisions allows 5 s for a cold start", async () => {
+  assert.deepEqual(pi.JUDGE_TIMEOUT_MS, { decisions: 5000, jev: 2000 });
+  for (const other of [claude, codex, grok]) {
+    assert.deepEqual(other.JUDGE_TIMEOUT_MS, pi.JUDGE_TIMEOUT_MS);
+    const waits: number[] = [];
+    const never = () => new Promise<never>(() => {});
+    const transport = {
+      fetch: never,
+      sleep: (ms: number) => {
+        waits.push(ms);
+        return Promise.resolve();
+      },
+    };
+    await assert.rejects(other.decide(state, "k", transport), { kind: "timeout" });
+    await assert.rejects(other.judge(state, "k", transport), { kind: "timeout" });
+    assert.deepEqual(waits, [5000, 2000]);
+  }
+});

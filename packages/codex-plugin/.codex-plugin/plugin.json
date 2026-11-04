@@ -2,13 +2,13 @@
   "name": "compact-adviser",
   "version": "0.1.14",
   "license": "MIT",
-  "description": "Suggests /compact at a completed checkpoint, judged by TypeSafe Jev. Hint-only on Codex (macOS and Linux): nothing outside a session can run /compact, so there is no automatic mode.",
+  "description": "Suggests /compact at a completed checkpoint, judged by OpenAI's Decisions API (default) or TypeSafe Jev. Hint-only on Codex (macOS and Linux): nothing outside a session can run /compact, so there is no automatic mode.",
   "author": {
     "name": "Kun Chen",
     "url": "https://github.com/kunchenguid"
   },
-  "homepage": "https://github.com/kunchenguid/compact-adviser#readme",
-  "repository": "https://github.com/kunchenguid/compact-adviser",
+  "homepage": "https://github.com/sowrabh/compact-adviser#readme",
+  "repository": "https://github.com/sowrabh/compact-adviser",
   "keywords": [
     "compact",
     "context",

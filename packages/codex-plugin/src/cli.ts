@@ -16,9 +16,12 @@ import {
   formatTokens,
   type Mode,
   parseBudget,
+  parseJudge,
   parseMinimum,
   parseMode,
   parseSavedApiKey,
+  SAVED_KEY,
+  selectedJudge,
 } from "./config.ts";
 import { DISABLE_ENV, disabledByEnv } from "./disable.ts";
 import { formatKeyStatus } from "./env.ts";
@@ -35,17 +38,19 @@ export const USAGE = `compact-adviser (Codex) - suggests /compact at a completed
 
 Usage: compact-adviser <command> [value]
 
-  status                    Mode, minimum, key source, and the latest session's cooldown
+  status                    Mode, judge, minimum, key source, and the latest session's cooldown
   hint                      Advise with a hint at eligible checkpoints (default)
   off                       Stop advising; Codex's own compaction is unaffected
+  judge <decisions|jev>     Choose the judge: OpenAI's Decisions API (default) or TypeSafe Jev
   threshold <tokens>        Save an absolute token minimum, or "default" for ${DEFAULT_MINIMUM}
   budget <tokens|off>       Relax the hint floor toward this context size, or the window if smaller
-  log <on|off>              Log each TypeSafe request and its outcome to a local jsonl file
-  key <set|clear|status>    Save, clear, or report the TypeSafe API key (never printed)
+  log <on|off>              Log each judge request and its outcome to a local jsonl file
+  key <set|clear|status>    Save, clear, or report the selected judge's API key (never printed)
 
 Automatic compaction is not available on Codex: nothing outside a session can run /compact.
-A key may also come from TYPESAFE_API_KEY in the environment or a .env file in the session's
-working directory; that takes precedence over the saved one.`;
+A key may also come from the environment (OPENAI_DECISIONS_API_KEY for decisions,
+TYPESAFE_API_KEY for jev) or a .env file in the session's working directory; the environment
+takes precedence over the saved key, and the saved key over .env.`;
 
 export interface CliEnvironment {
   env: NodeJS.ProcessEnv;
@@ -58,7 +63,13 @@ export interface CliEnvironment {
 function statusText(environment: CliEnvironment): string {
   const root = adviserRoot(environment.env);
   const config = new ConfigStore(root).read();
-  const key = resolveKey(environment.env, config.typesafeApiKey, environment.cwd);
+  const judgeName = selectedJudge(config);
+  const key = resolveKey(
+    environment.env,
+    config[SAVED_KEY[judgeName].field],
+    environment.cwd,
+    judgeName,
+  );
   const store = new SessionStore(root);
   const latest = store.latest();
   const now = environment.now();
@@ -70,10 +81,11 @@ function statusText(environment: CliEnvironment): string {
   const budget = config.contextBudgetTokens;
   const usage = latest === undefined ? Number.NaN : usageFraction(latest, budget);
   const window = Number.isFinite(usage)
-    ? ` Context: ${formatTokens(latest?.tokens ?? 0)} tokens, ${Math.round(usage * 100)}% of the ${effectiveBudget(latest?.window ?? Number.NaN, budget) > 0 ? "budget" : "window"}; hint floor ${floorFor(usage, parseProfile(config.profile)).toFixed(2)}.`
+    ? ` Context: ${formatTokens(latest?.tokens ?? 0)} tokens, ${Math.round(usage * 100)}% of the ${effectiveBudget(latest?.window ?? Number.NaN, budget) > 0 ? "budget" : "window"}; hint floor ${floorFor(usage, parseProfile(config.profile, judgeName), judgeName).toFixed(2)}.`
     : "";
   return [
     `Mode: ${config.mode}.`,
+    `Judge: ${judgeName}.`,
     `Minimum: ${formatTokens(config.minContextTokens)} tokens.`,
     `Budget: ${budget > 0 ? `${formatTokens(budget)} tokens` : "off"}.`,
     `${formatKeyStatus(key.source)}.`,
@@ -104,32 +116,44 @@ function saveBudget(environment: CliEnvironment, value: string): string {
     : "Context budget off (all sessions): the hint floor follows the model's window.";
 }
 
+function saveJudge(environment: CliEnvironment, value: string): string {
+  const judgeName = parseJudge(value);
+  new ConfigStore(adviserRoot(environment.env)).update({ judge: judgeName });
+  return judgeName === "decisions"
+    ? "Judge saved: OpenAI Decisions (all sessions). It reads OPENAI_DECISIONS_API_KEY or a saved OpenAI key."
+    : "Judge saved: TypeSafe Jev (all sessions). It reads TYPESAFE_API_KEY or a saved TypeSafe key.";
+}
+
 function saveLog(environment: CliEnvironment, value: string): string {
   if (value !== "on" && value !== "off") throw new Error("Enter on or off.");
   const root = adviserRoot(environment.env);
-  new ConfigStore(root).update({ logRequests: value === "on" });
+  const store = new ConfigStore(root);
+  const company = selectedJudge(store.read()) === "decisions" ? "OpenAI" : "TypeSafe";
+  store.update({ logRequests: value === "on" });
   return value === "on"
-    ? `TypeSafe request logging on (all sessions). ${requestLogPath(root, "<session>")}`
-    : "TypeSafe request logging off (all sessions).";
+    ? `${company} request logging on (all sessions). ${requestLogPath(root, "<session>")}`
+    : `${company} request logging off (all sessions).`;
 }
 
 async function changeKey(environment: CliEnvironment, action: string): Promise<string> {
   const root = adviserRoot(environment.env);
   const store = new ConfigStore(root);
+  const judgeName = selectedJudge(store.read());
+  const { field, label } = SAVED_KEY[judgeName];
   if (action === "clear") {
-    store.update({ typesafeApiKey: "" });
-    return "Saved TypeSafe API key cleared (all sessions). Environment and .env still apply.";
+    store.update({ [field]: "" });
+    return `Saved ${label} cleared (all sessions). Environment and .env still apply.`;
   }
   if (action === "status" || action === "") {
     const config = store.read();
     return formatKeyStatus(
-      resolveKey(environment.env, config.typesafeApiKey, environment.cwd).source,
+      resolveKey(environment.env, config[field], environment.cwd, judgeName).source,
     );
   }
   if (action !== "set") throw new Error("Use key set, key clear, or key status.");
-  const value = parseSavedApiKey(await environment.readSecret("TypeSafe API key: "));
-  store.update({ typesafeApiKey: value });
-  return "TypeSafe API key saved (all sessions). Status shows the source, never the value.";
+  const value = parseSavedApiKey(await environment.readSecret(`${label}: `), judgeName);
+  store.update({ [field]: value });
+  return `${label} saved (all sessions). Status shows the source, never the value.`;
 }
 
 export async function run(argv: readonly string[], environment: CliEnvironment): Promise<string> {
@@ -143,6 +167,9 @@ export async function run(argv: readonly string[], environment: CliEnvironment):
       return saveMode(environment, parseMode(command));
     case "auto":
       throw new Error(AUTO_UNAVAILABLE);
+    case "judge":
+      if (!value) throw new Error("Choose a judge: decisions or jev.");
+      return saveJudge(environment, value);
     case "threshold":
       if (!value) throw new Error("Enter a token count, or default.");
       return saveThreshold(environment, value);

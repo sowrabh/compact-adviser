@@ -156,3 +156,14 @@ test("all real judge transports send selected questions", async () => {
   assert.equal(bodies.length, 4);
   for (const body of bodies) assert.deepEqual(JSON.parse(body).questions, questions);
 });
+
+test("Jev questions in a profile are refused while the Decisions judge is selected", () => {
+  const withQuestions = JSON.stringify({ ...defaults, questions: judge.QUESTIONS });
+  const floorsOnly = JSON.stringify(tailored);
+  for (const parser of parsers) {
+    assert.throws(() => parser.parseProfile(withQuestions, "decisions"), /jev judge only/);
+    assert.ok(parser.parseProfile(withQuestions, "jev")?.questions);
+    assert.ok(parser.parseProfile(withQuestions)?.questions);
+    assert.deepEqual(parser.parseProfile(floorsOnly, "decisions"), tailored);
+  }
+});

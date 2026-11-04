@@ -2,12 +2,12 @@
   "name": "compact-adviser",
   "version": "0.1.14",
   "license": "MIT",
-  "description": "Suggests /compact at a completed checkpoint, judged by TypeSafe Jev. Hint-only on Grok: the Stop hook judges and the status-line script shows the hint, which never reaches the model's context.",
+  "description": "Suggests /compact at a completed checkpoint, judged by OpenAI's Decisions API (default) or TypeSafe Jev. Hint-only on Grok: the Stop hook judges and the status-line script shows the hint, which never reaches the model's context.",
   "author": {
     "name": "Kun Chen"
   },
-  "homepage": "https://github.com/kunchenguid/compact-adviser#readme",
-  "repository": "https://github.com/kunchenguid/compact-adviser",
+  "homepage": "https://github.com/sowrabh/compact-adviser#readme",
+  "repository": "https://github.com/sowrabh/compact-adviser",
   "keywords": [
     "compact",
     "context",

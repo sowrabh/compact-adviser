@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as claudeDisable from "../../claude-mod/lib/disable.ts";
+import * as claudeIdle from "../../claude-mod/lib/idle.ts";
 import * as claude from "../../claude-mod/lib/judge.ts";
 import * as claudeLog from "../../claude-mod/lib/log.ts";
 import * as claudeSnapshot from "../../claude-mod/lib/snapshot.ts";
@@ -26,6 +27,7 @@ import * as grokSnapshot from "../../grok-plugin/lib/snapshot.ts";
 import * as grokState from "../../grok-plugin/lib/state.ts";
 import * as piContext from "../src/context.ts";
 import * as piDisable from "../src/disable.ts";
+import * as piIdle from "../src/idle.ts";
 import * as pi from "../src/judge.ts";
 import * as piLog from "../src/log.ts";
 import * as piState from "../src/state.ts";
@@ -469,12 +471,12 @@ test("every package applies the same cooldownReason gates", () => {
       reason: "Snoozed",
     },
     {
-      name: "typesafe backoff",
+      name: "judge backoff",
       tokens: 60000,
       now: 10999,
       compacted: false,
       patch: { retryAfter: 11000 },
-      reason: "TypeSafe backoff",
+      reason: "Judge backoff",
     },
     {
       name: "post-compaction no baseline",
@@ -535,4 +537,260 @@ test("every package reads the same COMPACT_ADVISER_DISABLE values the same way",
   }
   for (const value of truthy) assert.equal(piDisable.disabledByEnv(value), true, value);
   for (const value of falsy) assert.equal(piDisable.disabledByEnv(value), false, String(value));
+});
+
+const decisionsReply = (finished: unknown, handsOn: unknown, extra: object = {}) => ({
+  model: "gpt-6-luna",
+  answers: [
+    { type: "predicate", name: "finished", probability: finished },
+    { type: "predicate", name: "hands_on", probability: handsOn },
+  ],
+  usage: {
+    input_tokens: 8281,
+    input_tokens_details: { cached_tokens: 7474, cache_write_tokens: 0 },
+    output_tokens: 0,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: 8281,
+  },
+  ...extra,
+});
+
+test("every package names the same judges, key variables and Decisions endpoint", () => {
+  assert.deepEqual(pi.JUDGES, ["decisions", "jev"]);
+  assert.equal(pi.DEFAULT_JUDGE, "decisions");
+  assert.deepEqual(pi.API_KEY_ENV, {
+    decisions: "OPENAI_DECISIONS_API_KEY",
+    jev: "TYPESAFE_API_KEY",
+  });
+  assert.equal(pi.DECISIONS_ENDPOINT, "https://api.openai.com/v1/decisions");
+  assert.equal(pi.DECISIONS_MODEL, "gpt-6-luna");
+  for (const other of [claude, codex, grok]) {
+    assert.deepEqual(other.JUDGES, pi.JUDGES);
+    assert.equal(other.DEFAULT_JUDGE, pi.DEFAULT_JUDGE);
+    assert.deepEqual(other.API_KEY_ENV, pi.API_KEY_ENV);
+    assert.equal(other.DECISIONS_ENDPOINT, pi.DECISIONS_ENDPOINT);
+    assert.equal(other.DECISIONS_MODEL, pi.DECISIONS_MODEL);
+    assert.deepEqual(other.PREDICATES, pi.PREDICATES);
+  }
+  assert.deepEqual(
+    pi.PREDICATES.map((q) => [q.type, q.name]),
+    [
+      ["predicate", "finished"],
+      ["predicate", "hands_on"],
+    ],
+  );
+});
+
+test("every package sends byte-identical Decisions request bodies", () => {
+  for (const s of [state, { ...state, recent: [] }, {}, null]) {
+    const body = pi.decisionsRequestBody(s);
+    assert.equal(claude.decisionsRequestBody(s), body);
+    assert.equal(codex.decisionsRequestBody(s), body);
+    assert.equal(grok.decisionsRequestBody(s), body);
+  }
+  const sent = JSON.parse(pi.decisionsRequestBody(state));
+  assert.equal(sent.model, "gpt-6-luna");
+  assert.deepEqual(sent.questions, pi.PREDICATES);
+  // The Decisions judge reads the very state the Jev request carries.
+  const json = sent.input[0].content.find((part: { type: string }) => part.type === "input_json");
+  assert.deepEqual(json.data, JSON.parse(pi.requestBody(state)).state);
+  assert.throws(
+    () => pi.decisionsRequestBody({ blob: "x".repeat(40000) }),
+    (error: { kind?: string }) => error.kind === "input",
+  );
+});
+
+test("each judge keeps its own floor schedule, identical across packages", () => {
+  assert.deepEqual(pi.FLOORS.jev, [
+    [0.1, 0.9],
+    [0.9, 0.5],
+  ]);
+  // Decisions borrows Jev's schedule until it is refit on labelled checkpoints.
+  assert.deepEqual(pi.FLOORS.decisions, pi.FLOORS.jev);
+  assert.notEqual(pi.FLOORS.decisions, pi.FLOORS.jev);
+  for (const other of [claude, codex, grok]) {
+    assert.deepEqual(other.FLOORS, pi.FLOORS);
+    for (const name of pi.JUDGES) {
+      assert.equal(other.idleFloor(undefined, name), pi.idleFloor(undefined, name));
+      for (let u = -0.1; u <= 1.1; u += 0.01) {
+        assert.equal(other.floorFor(u, undefined, name), pi.floorFor(u, undefined, name));
+      }
+      assert.equal(
+        other.floorFor(Number.NaN, undefined, name),
+        pi.floorFor(Number.NaN, undefined, name),
+      );
+    }
+  }
+  assert.equal(pi.idleFloor(undefined, "decisions"), 0.5);
+  assert.equal(pi.floorFor(Number.NaN, undefined, "decisions"), 0.9);
+  const profile = {
+    version: 1 as const,
+    coordinationWeight: 0.5,
+    floors: [[0, 0.6]] as [number, number][],
+  };
+  assert.equal(pi.idleFloor(profile, "decisions"), 0.6);
+});
+
+test("every package parses the same Decisions replies into the same judgment", () => {
+  const good = decisionsReply(0.93, 0.4);
+  const parsed = pi.parseDecision(good);
+  assert.deepEqual(parsed, {
+    judge: "decisions",
+    finished: 0.93,
+    handsOn: 0.4,
+    model: "gpt-6-luna",
+    inputTokens: 8281,
+    outputTokens: 0,
+  });
+  for (const other of [claude, codex, grok]) assert.deepEqual(other.parseDecision(good), parsed);
+  const swapped = { ...good, answers: [...good.answers].reverse() };
+  assert.deepEqual(pi.parseDecision(swapped), parsed);
+  const refused = {
+    ...good,
+    answers: [good.answers[0], { type: "refusal", name: "hands_on" }],
+  };
+  const bad: [unknown, string][] = [
+    [refused, "refusal"],
+    [null, "response"],
+    [{}, "response"],
+    [{ ...good, answers: [good.answers[0]] }, "response"],
+    [{ ...good, answers: [good.answers[0], good.answers[0]] }, "response"],
+    [{ ...good, answers: [...good.answers, good.answers[1]] }, "response"],
+    [decisionsReply(1.2, 0.4), "response"],
+    [decisionsReply(-0.1, 0.4), "response"],
+    [decisionsReply("0.9", 0.4), "response"],
+    [decisionsReply(Number.NaN, 0.4), "response"],
+    [{ ...good, answers: [{ ...good.answers[0], type: "choice" }, good.answers[1]] }, "response"],
+    [{ ...good, model: 7 }, "response"],
+    [{ ...good, usage: { output_tokens: 0 } }, "response"],
+  ];
+  for (const [reply, kind] of bad) {
+    for (const host of [pi, claude, codex, grok]) {
+      assert.throws(
+        () => host.parseDecision(reply),
+        (error: { kind?: string }) => error.kind === kind,
+        JSON.stringify(reply),
+      );
+    }
+  }
+});
+
+test("every package scores and gates Decisions judgments the same way", () => {
+  const grid = [0, 0.3, 0.5, 0.79, 0.8, 0.9, 0.95, 1];
+  for (const finished of grid) {
+    for (const handsOn of grid) {
+      const verdict = pi.parseDecision(decisionsReply(finished, handsOn));
+      assert.equal(pi.score(verdict), finished * (0.5 + 0.5 * handsOn));
+      for (const other of [claude, codex, grok]) {
+        assert.equal(other.score(verdict), pi.score(verdict));
+        for (const usage of [Number.NaN, 0, 0.3, 0.5, 0.7, 0.85, 1]) {
+          assert.equal(other.qualifies(verdict, usage), pi.qualifies(verdict, usage));
+        }
+      }
+    }
+  }
+  assert.equal(pi.score(pi.parseDecision(decisionsReply(0.8, 0.5))), 0.6000000000000001);
+});
+
+test("every host classifies Decisions HTTP failures alike and never echoes the body or key", async () => {
+  const body = "private quota details must not appear in a warning";
+  for (const [status, kind] of [
+    [401, "authentication"],
+    [403, "authentication"],
+    [429, "rate-limit"],
+    [500, "server"],
+  ] as const) {
+    const results = await Promise.allSettled([
+      pi.decide(
+        state,
+        "sk-fixture-key",
+        new AbortController().signal,
+        (async () => new Response(body, { status })) as typeof fetch,
+      ),
+      ...[claude, codex, grok].map((host) =>
+        host.decide(state, "sk-fixture-key", {
+          fetch: async () => ({ status, ok: false, text: body }),
+          sleep: () => new Promise(() => {}),
+        }),
+      ),
+    ]);
+    const messages = results.map((result) => {
+      assert.equal(result.status, "rejected");
+      if (result.status !== "rejected") return "";
+      assert.equal(result.reason.kind, kind);
+      assert.ok(!result.reason.message.includes(body));
+      assert.ok(!result.reason.message.includes("sk-fixture-key"));
+      assert.match(result.reason.message, /OpenAI \(Decisions\)/);
+      assert.doesNotMatch(result.reason.message, /TypeSafe/);
+      return result.reason.message;
+    });
+    for (const message of messages) assert.equal(message, messages[0]);
+  }
+});
+
+test("every package writes the same Decisions log lines", () => {
+  const body = pi.decisionsRequestBody(state);
+  const verdict = pi.parseDecision(decisionsReply(0.93, 0.4));
+  const at = "2026-11-04T00:00:00.000Z";
+  const line = JSON.parse(piLog.responseLogLine(body, verdict, 0.2, at));
+  assert.deepEqual(line.answers, { finished: 0.93, hands_on: 0.4 });
+  assert.equal(line.judge, "decisions");
+  for (const other of [claudeLog, codexLog, grokLog]) {
+    assert.equal(
+      other.responseLogLine(body, verdict, 0.2, at),
+      piLog.responseLogLine(body, verdict, 0.2, at),
+    );
+    assert.equal(
+      other.responseLogLine(body, verdict, Number.NaN, at),
+      piLog.responseLogLine(body, verdict, Number.NaN, at),
+    );
+  }
+});
+
+test("every package scrubs the saved OpenAI key field the same way as the TypeSafe one", () => {
+  const secret = "sk-saved-openai-key-must-not-leave";
+  const dump = JSON.stringify({
+    judge: "decisions",
+    openaiApiKey: secret,
+    "compact-adviser.openaiApiKey": secret,
+  });
+  const loose = `openaiApiKey=${secret} and "compact-adviser.openaiApiKey": "${secret}"`;
+  for (const other of [claudeSnapshot, codexSnapshot, grokSnapshot]) {
+    assert.deepEqual(other.redactOwnedSettings(dump), piContext.redactOwnedSettings(dump));
+    assert.deepEqual(other.redactOwnedSettings(loose), piContext.redactOwnedSettings(loose));
+  }
+  for (const text of [dump, loose]) {
+    const clean = piContext.redactOwnedSettings(text);
+    assert.equal(clean.redacted, true);
+    assert.ok(!clean.text.includes(secret));
+  }
+  assert.ok(piContext.redactOwnedSettings(dump).text.includes("decisions"));
+});
+
+test("Pi and Claude Code place the walk-away point the same way for the same cache", () => {
+  for (const ttlMs of [5 * 60_000, 60 * 60_000]) {
+    for (const minutes of [0, 1, 20, 90]) {
+      const ttl = { ttlMs, known: true, caching: true };
+      assert.equal(piIdle.idleDelayMs(ttl, minutes), claudeIdle.idleDelayMs(ttl, minutes));
+    }
+  }
+});
+
+test("each judge has its own timeout: Jev keeps 2 s, Decisions allows 5 s for a cold start", async () => {
+  assert.deepEqual(pi.JUDGE_TIMEOUT_MS, { decisions: 5000, jev: 2000 });
+  for (const other of [claude, codex, grok]) {
+    assert.deepEqual(other.JUDGE_TIMEOUT_MS, pi.JUDGE_TIMEOUT_MS);
+    const waits: number[] = [];
+    const never = () => new Promise<never>(() => {});
+    const transport = {
+      fetch: never,
+      sleep: (ms: number) => {
+        waits.push(ms);
+        return Promise.resolve();
+      },
+    };
+    await assert.rejects(other.decide(state, "k", transport), { kind: "timeout" });
+    await assert.rejects(other.judge(state, "k", transport), { kind: "timeout" });
+    assert.deepEqual(waits, [5000, 2000]);
+  }
 });

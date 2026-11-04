@@ -2,9 +2,9 @@
 //
 // Claude Code runs with an isolated configuration directory, this package loaded through
 // --plugin-dir, a deterministic local stand-in for the Anthropic Messages API
-// (ANTHROPIC_BASE_URL), and a local TypeSafe fixture reached through the mod's
+// (ANTHROPIC_BASE_URL), and a local judge fixture reached through the mod's
 // loopback-only COMPACT_ADVISER_TEST_ENDPOINT. No account credential, model quota, or
-// real TypeSafe request is used, and no user configuration is read or written.
+// real judge request is used, and no user configuration is read or written.
 //
 // It proves:
 //   1. With CLAUDE_CODE_ENABLE_FUNCTION_HOOKS unset the mod is inert: no status strip and no
@@ -34,11 +34,12 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CLAUDE, claudeEnv, claudeVersion, PACKAGE } from "./common.mjs";
+import { CLAUDE, claudeEnv, claudeVersion, PACKAGE, shellExports, shellQuote } from "./common.mjs";
 
 const HINT = "work appears completed or recorded. Run /compact to save tokens.";
 const API_KEY = "sk-ant-fixture-not-a-real-key-0000000000";
 const TYPESAFE_KEY = "tsk-live-fixture-key";
+const OPENAI_KEY = "sk-live-fixture-openai-key";
 const SOCKET = `compact-adviser-e2e-${process.pid}`;
 const SESSION = "e2e";
 const version = claudeVersion();
@@ -47,7 +48,10 @@ const config = join(lab, "config");
 const project = join(lab, "project");
 mkdirSync(config, { recursive: true });
 mkdirSync(project, { recursive: true });
-writeFileSync(join(project, ".env"), `TYPESAFE_API_KEY=${TYPESAFE_KEY}\n`);
+writeFileSync(
+  join(project, ".env"),
+  `TYPESAFE_API_KEY=${TYPESAFE_KEY}\nOPENAI_DECISIONS_API_KEY=${OPENAI_KEY}\n`,
+);
 const MARKER = join(project, "before-compact-marker.txt");
 const MARKER_BODY = "MARKER_SKILL_E2E write before-compact-marker.txt";
 mkdirSync(join(project, ".claude", "skills", "marker"), { recursive: true });
@@ -68,6 +72,8 @@ writeFileSync(join(project, ".claude", "commands", "marker.md"), markerSkill);
 const jevRequests = [];
 const summaries = [];
 const liveEvents = [];
+// Keep-warm forks: the session's own request with the one-line ping after it.
+const forks = [];
 const verdict = { completed: 0.99, handsOn: 0.99 };
 
 function jevAnswer() {
@@ -84,6 +90,17 @@ function jevAnswer() {
       shape: choice("hands_on", verdict.handsOn, ["coordinating", "unclear"]),
     },
     usage: { input_tokens: 2500, output_tokens: 0 },
+  };
+}
+
+function decisionsAnswer() {
+  return {
+    model: "gpt-6-luna",
+    answers: [
+      { type: "predicate", name: "finished", probability: verdict.completed },
+      { type: "predicate", name: "hands_on", probability: verdict.handsOn },
+    ],
+    usage: { input_tokens: 8200, output_tokens: 0 },
   };
 }
 
@@ -105,6 +122,12 @@ function reply(body) {
       input: 70000,
     };
   }
+  if (text.includes("Reply with exactly: OK")) {
+    forks.push(Date.now());
+    liveEvents.push("fork");
+    // A hit: the cache served the replayed prefix.
+    return { text: "OK", input: 16, cacheRead: 70000 };
+  }
   if (text.includes(MARKER_BODY) || /(?:^|\n)\/marker\b/.test(text)) {
     writeFileSync(MARKER, "ran\n");
     liveEvents.push("marker");
@@ -121,7 +144,7 @@ function reply(body) {
 }
 
 function send(res, body) {
-  const { text, input } = reply(body);
+  const { text, input, cacheRead = 0 } = reply(body);
   const message = {
     id: `msg_${Date.now()}`,
     type: "message",
@@ -134,7 +157,7 @@ function send(res, body) {
       input_tokens: input,
       output_tokens: 40,
       cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      cache_read_input_tokens: cacheRead,
     },
   };
   if (!body.stream) {
@@ -161,9 +184,10 @@ function send(res, body) {
     });
   }
   event("content_block_stop", { index: 0 });
+  // As the real API does, the closing delta carries the whole usage, cache reads included.
   event("message_delta", {
     delta: { stop_reason: "end_turn", stop_sequence: null },
-    usage: { output_tokens: 40 },
+    usage: message.usage,
   });
   event("message_stop", {});
   res.end();
@@ -185,7 +209,7 @@ const server = createServer((req, res) => {
       if (req.url.startsWith("/v1/systemone")) {
         jevRequests.push({ authorization: req.headers.authorization, body });
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(jevAnswer()));
+        res.end(JSON.stringify(body.model === "gpt-6-luna" ? decisionsAnswer() : jevAnswer()));
       } else if (req.url.startsWith("/v1/messages/count_tokens")) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ input_tokens: 1000 }));
@@ -278,11 +302,8 @@ function launch(flag) {
   // This process may be launched with the product kill switch set. The live harness
   // has to observe the plugin, so it must not inherit that.
   delete env.COMPACT_ADVISER_DISABLE;
-  const exports = Object.entries(env)
-    .filter(([name]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
-    .map(([name, value]) => `${name}=${JSON.stringify(value).replace(/\$/g, "\\$")}`)
-    .join(" ");
-  const cmd = `env -i ${exports} ${JSON.stringify(CLAUDE)} --plugin-dir ${JSON.stringify(PACKAGE)} --model claude-sonnet-4-5 --debug-file ${JSON.stringify(join(lab, `debug-${flag ? "on" : "off"}.log`))}; echo CLAUDE_EXIT=$?; sleep 30`;
+  const exports = shellExports(env);
+  const cmd = `env -i ${exports} ${shellQuote(CLAUDE)} --plugin-dir ${shellQuote(PACKAGE)} --model claude-sonnet-4-5 --debug-file ${shellQuote(join(lab, `debug-${flag ? "on" : "off"}.log`))}; echo CLAUDE_EXIT=$?; sleep 30`;
   tmux("new-session", "-d", "-s", SESSION, "-x", "140", "-y", "45", "-c", project, cmd);
 }
 
@@ -353,7 +374,7 @@ try {
   await command("/compact-adviser");
   await waitText("Minimum context         40,000 tokens");
   await waitText("Reset minimum to 40,000");
-  await waitText("TypeSafe API key        from .env");
+  await waitText("OpenAI API key          from .env");
   if (screen().includes("TypeSafe sharing")) {
     throw new Error(`[${step}] sharing toggle still present\n${screen()}`);
   }
@@ -419,26 +440,27 @@ try {
   }
 
   step = "request logging";
-  await moveTo("Log TypeSafe requests");
+  await moveTo("Log OpenAI requests");
   key("Enter");
-  await waitText("› Log TypeSafe requests");
+  await waitText("› Log OpenAI requests");
   await waitText("● Off (default)");
   await moveTo("On");
   key("Enter");
-  await waitText("TypeSafe request logging on (all sessions)", 20000);
+  // Claude Code 2.1.318 no longer draws a toast over an open pane, so the saved option and the
+  // redrawn row are the evidence; 2.1.275 also showed the confirmation toast here.
   await waitFor(() => pluginOptions().logRequests === true, "the host to enable request logging");
-  await waitText("Log TypeSafe requests   On");
+  await waitText("Log OpenAI requests     On");
   pass("request logging is enabled by arrows and Enter alone through the real settings pane");
 
   step = "escape back";
   // After the save the ring is back on the row that was opened; Escape inside a view returns
   // to the list with the keyboard, and the list then closes on Escape.
-  await moveTo("Log TypeSafe requests");
+  await moveTo("Log OpenAI requests");
   key("Enter");
   await waitText("● On");
   key("Escape");
   await waitText("↑↓ move · Enter select · Esc close");
-  await moveTo("Log TypeSafe requests", "Up");
+  await moveTo("Log OpenAI requests", "Up");
   pass("Escape in a view returns to the list, keeping the keyboard and the row");
 
   step = "pane minimum";
@@ -475,15 +497,16 @@ try {
     throw new Error(`[${step}] expected one host-highlighted status line\n${hintShot}`);
   }
   if (jevRequests.length !== 1)
-    throw new Error(`[${step}] expected one TypeSafe request, saw ${jevRequests.length}`);
+    throw new Error(`[${step}] expected one judge request, saw ${jevRequests.length}`);
   const request = jevRequests[0];
-  if (request.authorization !== `Bearer ${TYPESAFE_KEY}` || request.body.model !== "jev-latest") {
+  // The default judge: OpenAI's Decisions API with its own key.
+  if (request.authorization !== `Bearer ${OPENAI_KEY}` || request.body.model !== "gpt-6-luna") {
     throw new Error(
-      `[${step}] unexpected TypeSafe request ${JSON.stringify({ ...request, body: request.body.model })}`,
+      `[${step}] unexpected judge request ${JSON.stringify({ ...request, body: request.body.model })}`,
     );
   }
-  if (JSON.stringify(request.body).includes(TYPESAFE_KEY))
-    throw new Error(`[${step}] the key leaked into the body`);
+  if ([OPENAI_KEY, TYPESAFE_KEY].some((key) => JSON.stringify(request.body).includes(key)))
+    throw new Error(`[${step}] a key leaked into the body`);
   const logDir = join(lab, ".claude");
   const logNames = readdirSync(logDir).filter(
     (name) => name.startsWith("compact-adviser-requests-") && name.endsWith(".jsonl"),
@@ -500,21 +523,22 @@ try {
   const [loggedRequest, loggedResponse] = logLines;
   if (
     loggedResponse.id !== loggedRequest.id ||
-    loggedResponse.answers?.done?.choice !== "finished" ||
-    loggedResponse.answers?.shape?.choice !== "hands_on" ||
+    loggedResponse.judge !== "decisions" ||
+    typeof loggedResponse.answers?.finished !== "number" ||
+    typeof loggedResponse.answers?.hands_on !== "number" ||
     typeof loggedResponse.score !== "number" ||
     typeof loggedResponse.usage !== "number" ||
     typeof loggedResponse.floor !== "number" ||
     loggedResponse.qualifies !== true
   ) {
-    throw new Error(`[${step}] Jev decision log is incomplete: ${JSON.stringify(loggedResponse)}`);
+    throw new Error(`[${step}] Decisions log is incomplete: ${JSON.stringify(loggedResponse)}`);
   }
-  if (readFileSync(requestLog, "utf8").includes(TYPESAFE_KEY))
-    throw new Error(`[${step}] the TypeSafe key leaked into the request log`);
+  if ([OPENAI_KEY, TYPESAFE_KEY].some((key) => readFileSync(requestLog, "utf8").includes(key)))
+    throw new Error(`[${step}] a key leaked into the request log`);
   if (process.env.COMPACT_TEST_LOG_EVIDENCE)
     copyFileSync(requestLog, process.env.COMPACT_TEST_LOG_EVIDENCE);
   pass(
-    "a settled 70,000-token exchange is judged once, shows the hint, and logs its complete Jev decision without the key",
+    "a settled 70,000-token exchange is judged once by the Decisions judge, shows the hint, and logs its complete decision without a key",
   );
 
   step = "back-to-back hints";
@@ -567,16 +591,18 @@ try {
 
   // Before-compact: a skill-backed slash command runs, then compaction, and a typed
   // prompt while that turn is pending leaves the conversation uncompacted.
-  function setBeforePrompt(value) {
+  function setOptions(patch) {
     const settingsPath = join(config, "settings.json");
     const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
     const name = Object.keys(settings.pluginConfigs ?? {}).find((n) =>
       n.startsWith("compact-adviser"),
     );
     if (!name) throw new Error("compact-adviser plugin config is missing");
-    settings.pluginConfigs[name].options.beforeCompactPrompt = value;
-    settings.pluginConfigs[name].options.mode = "auto";
+    Object.assign(settings.pluginConfigs[name].options, patch);
     writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  }
+  function setBeforePrompt(value) {
+    setOptions({ beforeCompactPrompt: value, mode: "auto" });
   }
 
   step = "before-compact skill";
@@ -641,6 +667,60 @@ try {
     throw new Error(`[${step}] compaction notice appeared after the interrupting prompt`);
   }
   pass("a prompt typed while the before-compact turn is pending does not compact");
+
+  // Walking away: a 6-second idle point stands in for the 50 minutes before a 1-hour cache
+  // lapses. A finished checkpoint that did not clear the turn-end floor compacts once.
+  step = "walk-away compaction";
+  try {
+    tmux("kill-server");
+  } catch {}
+  setOptions({ mode: "auto", beforeCompactPrompt: "", idleMinutes: 0.1, keepWarmHours: 8 });
+  verdict.completed = 0.99;
+  verdict.handsOn = 0.2;
+  const summariesBeforeAway = summaries.length;
+  launch(true);
+  await ready();
+  await command("E2E-PROMPT-1 a finished but coordinating unit");
+  await waitText("compact-adviser: automatic compaction completed", 60000);
+  if (summaries.length !== summariesBeforeAway + 1) {
+    throw new Error(`[${step}] expected one compaction once the person walked away`);
+  }
+  if (!screen().includes("You were away")) {
+    throw new Error(`[${step}] the transcript line does not say the person was away`);
+  }
+  if (forks.length !== 0) throw new Error(`[${step}] a finished checkpoint was kept warm`);
+  pass("walking away from a finished checkpoint compacts once, without keeping it warm");
+
+  // An unfinished checkpoint never compacts on walk-away; from the second exchange on its
+  // cache is kept warm with forks, and typing in the prompt box stops them.
+  step = "keep-warm";
+  try {
+    tmux("kill-server");
+  } catch {}
+  verdict.completed = 0.3;
+  verdict.handsOn = 0.99;
+  const summariesBeforeWarm = summaries.length;
+  launch(true);
+  await ready();
+  await command("E2E-PROMPT-1 start the work");
+  await waitFor(() => jevRequests.length > 0, "the first judgment", 60000);
+  await command("E2E-PROMPT-2 keep going");
+  await waitFor(() => forks.length >= 2, "two keep-warm forks", 60000);
+  if (summaries.length !== summariesBeforeWarm) {
+    throw new Error(`[${step}] an unfinished checkpoint was compacted on walk-away`);
+  }
+  if (!/^❯[\s\u00a0]*$/m.test(screen()) || screen().includes("Reply with exactly")) {
+    throw new Error(`[${step}] the keep-warm ping reached the transcript\n${screen()}`);
+  }
+  type("x");
+  const forksWhenTyping = forks.length;
+  await sleep(15000);
+  if (forks.length > forksWhenTyping + 1) {
+    throw new Error(`[${step}] typing in the prompt box did not stop keep-warm`);
+  }
+  pass(
+    "an unfinished checkpoint is kept warm with forks that stay out of the transcript, and typing stops them",
+  );
   console.log(`\n${results.length} live checks passed on Claude Code ${version}.`);
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);

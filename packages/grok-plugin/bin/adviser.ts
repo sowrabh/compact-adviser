@@ -38,27 +38,37 @@ import {
   DEFAULT_MINIMUM,
   formatTokens,
   parseBudget,
+  parseJudge,
   parseMinimum,
   parseMode,
   parseSavedApiKey,
+  parseSettings,
   readSettings,
+  SAVED_KEY,
   type Settings,
   SettingsError,
   STATUS_LINE_ITEMS,
+  selectedJudge,
   writeSettings,
 } from "../lib/config.ts";
 import { DISABLE_ENV, disabledByEnv } from "../lib/disable.ts";
-import { formatKeyStatus, parseDotenvKey, resolveTypesafeApiKey } from "../lib/env.ts";
+import { formatKeyStatus, parseDotenvKey, resolveApiKey } from "../lib/env.ts";
 import {
+  API_KEY_ENV,
+  DECISIONS_ENDPOINT,
+  decide,
+  decisionsRequestBody,
   effectiveBudget,
   floorFor,
   JudgeError,
+  type JudgeName,
   judge,
   MAX_RESPONSE_BYTES,
   qualifies,
   requestBody,
   score,
   typesafeEndpoint,
+  type Verdict,
 } from "../lib/judge.ts";
 import {
   errorLogLine,
@@ -105,8 +115,10 @@ const USAGE = `compact-adviser (Grok)
   mode hint|off              hint shows advice; off disables it (Grok's own auto-compact is unaffected)
   threshold <tokens|default> minimum context tokens before a checkpoint is judged
   budget <tokens|off>        relax the hint floor toward this context size, or the window if smaller
-  key <value>|key clear      save or clear the TypeSafe API key from a shell (TYPESAFE_API_KEY still wins)
-  log on|off                 TypeSafe request logging, off by default
+  judge decisions|jev        the judge: OpenAI's Decisions API (default) or TypeSafe Jev
+  key <value>|key clear      save or clear the selected judge's API key from a shell
+                             (OPENAI_DECISIONS_API_KEY or TYPESAFE_API_KEY in the environment wins)
+  log on|off                 judge request logging, off by default
   snooze                     no advice for three more completed exchanges in this session
   dismiss                    take the current hint off the status row
   install                    register the hooks in your Grok home, then print the status-line block`;
@@ -138,26 +150,60 @@ function settingsOrThrow(): Settings {
   return readSettings(settingsPath(env()));
 }
 
+/**
+ * Merges the patch into the stored fields and validates the result as a whole, so a patch can
+ * repair the field that made the file invalid (such as `judge: "jev"` for a Jev-only profile);
+ * fields it does not touch must still be valid.
+ */
 function updateSettings(patch: Partial<Settings>): Settings {
-  const current = settingsOrThrow();
-  const next: Settings = { ...current, ...patch, version: 1 };
+  const next = parseSettings({ ...storedSettings(), ...patch, version: 1 });
   writeSettings(settingsPath(env()), next);
   return next;
 }
 
-function dotenvKey(cwd: string): string | undefined {
+/** The settings file's own fields, unvalidated; no file is the defaults. */
+function storedSettings(): Record<string, unknown> {
+  let text: string;
   try {
-    return parseDotenvKey(readFileSync(join(cwd, ".env"), "utf8"), "TYPESAFE_API_KEY");
+    text = readFileSync(settingsPath(env()), "utf8");
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") return { ...parseSettings(undefined) };
+    throw new SettingsError("Cannot read the compact-adviser settings file; no action is taken.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new SettingsError(
+      "The compact-adviser settings file is not valid JSON; no action is taken.",
+    );
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed as { version?: unknown }).version !== 1
+  ) {
+    throw new SettingsError("Cannot read the compact-adviser settings file; no action is taken.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function dotenvKey(cwd: string, name: string): string | undefined {
+  try {
+    return parseDotenvKey(readFileSync(join(cwd, ".env"), "utf8"), name);
   } catch {
     return undefined;
   }
 }
 
-function resolveKey(settings: Settings, cwd: string) {
-  return resolveTypesafeApiKey(
-    process.env.TYPESAFE_API_KEY,
-    settings.typesafeApiKey,
-    dotenvKey(cwd),
+/** The selected judge's key: hook environment, then the saved key, then the cwd `.env`. */
+function resolveKey(settings: Settings, cwd: string, judgeName = selectedJudge(settings)) {
+  const name = API_KEY_ENV[judgeName];
+  return resolveApiKey(
+    process.env[name],
+    settings[SAVED_KEY[judgeName].field],
+    dotenvKey(cwd, name),
   );
 }
 
@@ -166,9 +212,15 @@ function testEndpoint(): string | undefined {
   return value !== undefined && LOOPBACK_ENDPOINT.test(value) ? value : undefined;
 }
 
-/** The live regression's fixture, else TypeSafe under `TYPESAFE_BASE` from the hook environment. */
-function judgeEndpoint(): string {
-  const endpoint = testEndpoint() ?? typesafeEndpoint(process.env.TYPESAFE_BASE);
+/**
+ * The live regression's fixture, else the selected judge's endpoint: OpenAI's Decisions API, or
+ * TypeSafe under `TYPESAFE_BASE` from the hook environment.
+ */
+function judgeEndpoint(judgeName: JudgeName): string {
+  const fixture = testEndpoint();
+  if (fixture !== undefined) return fixture;
+  if (judgeName === "decisions") return DECISIONS_ENDPOINT;
+  const endpoint = typesafeEndpoint(process.env.TYPESAFE_BASE);
   if (endpoint === undefined) throw new JudgeError("configuration");
   return endpoint;
 }
@@ -337,14 +389,27 @@ async function runStop(payload: HookPayload): Promise<void> {
     clearVerdict(verdict);
     return;
   }
-  const key = resolveKey(settings, cwd);
+  const judgeName = selectedJudge(settings);
+  const key = resolveKey(settings, cwd, judgeName);
   const activeKey = key.value?.trim() ?? "";
   if (!activeKey) return;
 
   const transcript = readTranscript(dir);
   if (transcript.unreadableLines !== 0) return;
   if (!transcript.messages.length) return;
-  const view = snapshot(transcript.messages, [activeKey], transcript.hasImages);
+  // Both judges' keys are scrubbed, so neither provider ever receives the other's.
+  const view = snapshot(
+    transcript.messages,
+    [
+      activeKey,
+      resolveKey(settings, cwd, judgeName === "decisions" ? "jev" : "decisions").value,
+      process.env.OPENAI_DECISIONS_API_KEY,
+      process.env.TYPESAFE_API_KEY,
+      settings.typesafeApiKey,
+      settings.openaiApiKey,
+    ],
+    transcript.hasImages,
+  );
   if (view.conversationTokens <= MINIMUM_CONVERSATION_TOKENS) return;
 
   // `contextTokensUsed` is the honest number when signals.json is readable; the local estimate
@@ -353,30 +418,28 @@ async function runStop(payload: HookPayload): Promise<void> {
   if (tokens < settings.minContextTokens) return;
   if (cooldownReason(state, tokens, now) !== undefined) return;
 
-  const profile = parseProfile(settings.profile);
+  const profile = parseProfile(settings.profile, judgeName);
   const fingerprint = checkpointKey(view.checkpointText);
   if (state.lastHintKey === fingerprint) return;
 
+  const body = () =>
+    judgeName === "decisions" ? decisionsRequestBody(view.state) : requestBody(view.state, profile);
   let loggedBody: string | undefined;
   if (settings.logRequests) {
     try {
-      loggedBody = requestBody(view.state, profile);
+      loggedBody = body();
       appendLog(sessionId, requestLogLine(loggedBody));
     } catch {
       // A body too large to send is reported by `judge` below; logging does not decide.
     }
   }
-  let judgment: Awaited<ReturnType<typeof judge>>;
+  let judgment: Verdict;
   try {
-    judgment = await judge(
-      view.state,
-      activeKey,
-      {
-        ...cancellableJudgeTransport(),
-        endpoint: judgeEndpoint(),
-      },
-      profile,
-    );
+    const transport = { ...cancellableJudgeTransport(), endpoint: judgeEndpoint(judgeName) };
+    judgment =
+      judgeName === "decisions"
+        ? await decide(view.state, activeKey, transport)
+        : await judge(view.state, activeKey, transport, profile);
   } catch (error) {
     if (settings.logRequests) {
       appendLog(sessionId, errorLogLine(loggedJudgeErrorKind(error), loggedBody));
@@ -392,7 +455,7 @@ async function runStop(payload: HookPayload): Promise<void> {
     appendLog(
       sessionId,
       responseLogLine(
-        loggedBody ?? requestBody(view.state, profile),
+        loggedBody ?? body(),
         judgment,
         fraction,
         undefined,
@@ -408,6 +471,7 @@ async function runStop(payload: HookPayload): Promise<void> {
     const latest = settingsOrThrow();
     settingsChanged =
       latest.profile !== settings.profile ||
+      latest.judge !== settings.judge ||
       latest.contextBudgetTokens !== settings.contextBudgetTokens;
   } catch {}
   if (settingsChanged || !qualifies(judgment, fraction, profile)) {
@@ -623,9 +687,11 @@ function runStatusLine(): void {
 function statusText(): string {
   const settings = settingsOrThrow();
   const home = grokHome(env());
-  const key = resolveKey(settings, process.cwd());
+  const judgeName = selectedJudge(settings);
+  const key = resolveKey(settings, process.cwd(), judgeName);
   const lines = [
     `Mode: ${settings.mode} (Grok is hint-only; nothing outside a session can run /compact).`,
+    `Judge: ${judgeName}.`,
     `Minimum context: ${formatTokens(settings.minContextTokens)} tokens.`,
     `Budget: ${settings.contextBudgetTokens > 0 ? `${formatTokens(settings.contextBudgetTokens)} tokens` : "off"}.`,
     `${formatKeyStatus(key.source)}.`,
@@ -654,7 +720,7 @@ function statusText(): string {
       }`,
     );
     const diagnostic = loadDiagnostic(diagnosticPath(dataDir(env()), sessionId));
-    if (diagnostic) lines.push(`Last TypeSafe outcome: ${diagnostic}.`);
+    if (diagnostic) lines.push(`Last judge outcome: ${diagnostic}.`);
   }
   return lines.join("\n");
 }
@@ -711,17 +777,28 @@ function runCommand(argv: readonly string[]): string {
         ? `Context budget saved: ${formatTokens(count)} tokens.`
         : "Context budget off: the hint floor follows the model's window.";
     }
-    case "key":
+    case "judge": {
+      const judgeName = parseJudge(value);
+      updateSettings({ judge: judgeName });
+      return judgeName === "decisions"
+        ? "Judge saved: OpenAI Decisions. It reads OPENAI_DECISIONS_API_KEY or a saved OpenAI key."
+        : "Judge saved: TypeSafe Jev. It reads TYPESAFE_API_KEY or a saved TypeSafe key.";
+    }
+    case "key": {
+      const judgeName = selectedJudge(settingsOrThrow());
+      const { field, label } = SAVED_KEY[judgeName];
       if (value === "clear") {
-        updateSettings({ typesafeApiKey: "" });
-        return "Saved TypeSafe API key cleared. TYPESAFE_API_KEY and a cwd .env still apply.";
+        updateSettings({ [field]: "" });
+        return `Saved ${label} cleared. ${API_KEY_ENV[judgeName]} and a cwd .env still apply.`;
       }
-      updateSettings({ typesafeApiKey: parseSavedApiKey(value) });
-      return "TypeSafe API key saved. Status shows the source, never the value.";
+      updateSettings({ [field]: parseSavedApiKey(value, judgeName) });
+      return `${label} saved. Status shows the source, never the value.`;
+    }
     case "log": {
       if (value !== "on" && value !== "off") throw new SettingsError("Choose on or off.");
+      const company = selectedJudge(settingsOrThrow()) === "decisions" ? "OpenAI" : "TypeSafe";
       updateSettings({ logRequests: value === "on" });
-      return `TypeSafe request logging ${value}.`;
+      return `${company} request logging ${value}.`;
     }
     case "snooze":
       return snooze();

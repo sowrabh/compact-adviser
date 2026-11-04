@@ -1,6 +1,14 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { floorFor, JudgeError, type Judgment, qualifies, score } from "./judge.ts";
+import {
+  floorFor,
+  isDecision,
+  JudgeError,
+  judgeOf,
+  qualifies,
+  score,
+  type Verdict,
+} from "./judge.ts";
 
 import type { JudgeProfile } from "./profile.ts";
 
@@ -30,25 +38,33 @@ export function requestLogLine(body: string, at = new Date().toISOString()): str
 
 export function responseLogLine(
   body: string,
-  judgment: Judgment,
+  judgment: Verdict,
   usage: number,
   at = new Date().toISOString(),
   profile?: JudgeProfile,
   /** The context budget the usage is measured against; recorded only when it applies. */
   budget = 0,
 ): string {
+  // A Jev line keeps its original shape; a Decisions line names its judge and both predicates.
   return `${JSON.stringify({
     at,
     kind: "response",
     id: requestLogId(body),
-    answers: {
-      done: { choice: judgment.done.choice, probabilities: judgment.done.probabilities },
-      shape: { choice: judgment.shape.choice, probabilities: judgment.shape.probabilities },
-    },
+    ...(isDecision(judgment)
+      ? {
+          judge: "decisions",
+          answers: { finished: judgment.finished, hands_on: judgment.handsOn },
+        }
+      : {
+          answers: {
+            done: { choice: judgment.done.choice, probabilities: judgment.done.probabilities },
+            shape: { choice: judgment.shape.choice, probabilities: judgment.shape.probabilities },
+          },
+        }),
     score: score(judgment, profile),
     usage: Number.isFinite(usage) ? usage : null,
     ...(budget > 0 ? { budget } : {}),
-    floor: floorFor(usage, profile),
+    floor: floorFor(usage, profile, judgeOf(judgment)),
     qualifies: qualifies(judgment, usage, profile),
   })}\n`;
 }
@@ -74,7 +90,7 @@ export function appendRequestLog(agentDir: string, body: string): void {
 export function appendResponseLog(
   agentDir: string,
   body: string,
-  judgment: Judgment,
+  judgment: Verdict,
   usage: number,
   profile?: JudgeProfile,
   budget = 0,

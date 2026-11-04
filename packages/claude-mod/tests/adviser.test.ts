@@ -6,6 +6,7 @@ import {
   JUDGE_DISABLED_NETWORK_MESSAGE,
   judgeErrorMessage,
   parseJudgment,
+  QUESTIONS,
   score,
 } from "../lib/judge.ts";
 import { RECENT_TAIL_MESSAGES } from "../lib/snapshot.ts";
@@ -14,11 +15,13 @@ import {
   answered,
   autoFocused,
   commandRun,
+  decisionsAnswer,
   elements,
   interactiveStart,
   jevAnswer,
   KEY,
   longConversation,
+  OPENAI_KEY,
   PLUGIN,
   pane,
   rows,
@@ -117,6 +120,157 @@ describe("the COMPACT_ADVISER_DISABLE kill switch", () => {
       expect(w.journal.commands).toEqual([PLUGIN]);
     });
   }
+});
+
+describe("the judge switch", () => {
+  test("Decisions is the default judge: two predicates, the OpenAI key, the same hint", async ($, on) => {
+    const w = world(on, { judge: "absent", openaiKey: OPENAI_KEY, logRequests: true });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    const request = w.journal.requests[0] ?? { url: "", headers: {}, body: "" };
+    expect(request.url).toBe("https://api.openai.com/v1/decisions");
+    expect(request.headers.Authorization).toBe(`Bearer ${OPENAI_KEY}`);
+    const body = JSON.parse(request.body);
+    expect(body.model).toBe("gpt-6-luna");
+    expect(
+      body.questions.map((q: { type: string; name: string }) => `${q.type}:${q.name}`),
+    ).toEqual(["predicate:finished", "predicate:hands_on"]);
+    for (const secret of [OPENAI_KEY, KEY]) {
+      expect(request.body.includes(secret)).toBe(false);
+      for (const write of w.journal.fsWrites) expect(write.text.includes(secret)).toBe(false);
+    }
+    expect(w.journal.statuses.at(-1)).toBe(HINT);
+    const response = lastJsonl(w.journal.fsWrites[1]);
+    expect(response.judge).toBe("decisions");
+    expect(response.answers).toEqual({ finished: 0.99, hands_on: 0.99 });
+  });
+
+  test("a TypeSafe key in the environment never reaches OpenAI", async ($, on) => {
+    const w = world(on, { judge: "decisions", openaiKey: OPENAI_KEY, logRequests: true });
+    w.messages = longConversation(`Use ${KEY} for the other service.`);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(w.journal.requests[0]?.body.includes(KEY)).toBe(false);
+    for (const write of w.journal.fsWrites) expect(write.text.includes(KEY)).toBe(false);
+  });
+
+  test("the other judge's key from a cwd .env never reaches the selected judge", async ($, on) => {
+    const dotenvKey = "tsk-dotenv-only-secret-000";
+    const w = world(on, {
+      judge: "decisions",
+      key: undefined,
+      openaiKey: OPENAI_KEY,
+      logRequests: true,
+      dotenv: `TYPESAFE_API_KEY=${dotenvKey}\n`,
+    });
+    w.messages = longConversation(`Use ${dotenvKey} for the other service.`);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(w.journal.requests[0]?.body.includes(dotenvKey)).toBe(false);
+    for (const write of w.journal.fsWrites) expect(write.text.includes(dotenvKey)).toBe(false);
+  });
+
+  test("an OpenAI key in the environment never reaches TypeSafe", async ($, on) => {
+    const w = world(on, { judge: "jev", openaiKey: OPENAI_KEY, logRequests: true });
+    w.messages = longConversation(`Use ${OPENAI_KEY} for the other service.`);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(w.journal.requests[0]?.body.includes(OPENAI_KEY)).toBe(false);
+    for (const write of w.journal.fsWrites) expect(write.text.includes(OPENAI_KEY)).toBe(false);
+  });
+
+  test("judge jev asks TypeSafe with the TypeSafe key even when an OpenAI key is set", async ($, on) => {
+    const w = world(on, { judge: "jev", openaiKey: OPENAI_KEY });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests.map((r) => r.url)).toEqual(["https://api.typesafe.ai/v1/systemone"]);
+    expect(w.journal.requests[0]?.headers.Authorization).toBe(`Bearer ${KEY}`);
+  });
+
+  test("no substitution: Decisions without its key asks nobody, even with a TypeSafe key", async ($, on) => {
+    const w = world(on, { judge: "decisions" });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(0);
+    expect(hinted(w)).toBe(false);
+  });
+
+  test("a Decisions refusal or failure leaves context alone and names OpenAI", async ($, on) => {
+    const w = world(on, {
+      judge: "decisions",
+      openaiKey: OPENAI_KEY,
+      mode: "auto",
+      consent: { autoAcknowledged: true },
+    });
+    const refused = decisionsAnswer();
+    refused.answers[1] = { type: "refusal", name: "hands_on" } as never;
+    w.respond = async () => ({ status: 200, text: JSON.stringify(refused) });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(hinted(w)).toBe(false);
+    expect(w.journal.compactions).toHaveLength(0);
+    expect(w.journal.toasts.at(-1)).toContain("OpenAI (Decisions)");
+    expect(w.journal.toasts.at(-1)).toContain("declined to answer");
+    expect(Number(stored(w).retryAfter)).toBeGreaterThan(START);
+  });
+
+  test("a saved OpenAI key is used when the environment has none and stays hidden in /config", async ($, on) => {
+    const w = world(on, { judge: "decisions", savedOpenaiKey: OPENAI_KEY });
+    on("config.describe", async (_$, e) => ({ ...(e as object), isHidden: false }) as never);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests[0]?.headers.Authorization).toBe(`Bearer ${OPENAI_KEY}`);
+    const described = await $.config.describe({
+      key: `${PLUGIN}.openaiApiKey`,
+      label: "OpenAI API key",
+      isHidden: false,
+      provider: { plugin: PLUGIN, tier: "user" },
+    } as never);
+    expect((described as { isHidden?: boolean }).isHidden).toBe(true);
+  });
+
+  test("a profile with Jev questions disables advice while Decisions is selected", async ($, on) => {
+    const w = world(on, { judge: "decisions", openaiKey: OPENAI_KEY });
+    w.rows.set(
+      `${PLUGIN}.profile`,
+      JSON.stringify({
+        version: 1,
+        coordinationWeight: 0.5,
+        floors: [[0, 0.5]],
+        questions: QUESTIONS,
+      }),
+    );
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(0);
+    expect(w.journal.toasts.join(" ")).toContain("jev judge only");
+  });
+
+  test("the judge command saves a judge and refuses anything else", async ($, on) => {
+    const w = world(on, { judge: "decisions", openaiKey: OPENAI_KEY });
+    await $.session.start(interactiveStart);
+    await $.command.run(commandRun("judge jev"));
+    expect(w.rows.get(`${PLUGIN}.judge`)).toBe("jev");
+    await $.command.run(commandRun("judge gemini"));
+    expect(w.rows.get(`${PLUGIN}.judge`)).toBe("jev");
+    expect(w.journal.toasts.at(-1)).toContain("decisions or jev");
+  });
+
+  test("status names the judge and its key source, never a key", async ($, on) => {
+    const w = world(on, { judge: "decisions", openaiKey: OPENAI_KEY });
+    await $.session.start(interactiveStart);
+    await $.command.run(commandRun("status"));
+    const status = w.journal.logs.at(-1) ?? "";
+    expect(status).toContain("Judge: decisions");
+    expect(status).toContain("Key: env");
+    expect(status.includes(OPENAI_KEY)).toBe(false);
+    expect(status.includes(KEY)).toBe(false);
+  });
 });
 
 describe("turn-end gates", () => {
@@ -348,7 +502,8 @@ describe("turn-end gates", () => {
     const w = world(on, { dotenv: "TYPESAFE_API_KEY=from-dotenv\n" });
     await $.session.start(interactiveStart);
     await turnEnd($, w);
-    expect(w.journal.fsReads).toEqual([]);
+    // The .env is read only to scrub the other judge's key, never to pick this one.
+    expect(w.journal.fsReads.every((path) => path.endsWith(".env"))).toBe(true);
     expect(w.journal.requests).toHaveLength(1);
     expect(w.journal.requests[0]?.headers.Authorization).toBe(`Bearer ${KEY}`);
     expect(w.journal.requests[0]?.body.includes("from-dotenv")).toBe(false);
@@ -362,7 +517,8 @@ describe("turn-end gates", () => {
     });
     await $.session.start(interactiveStart);
     await turnEnd($, w);
-    expect(w.journal.fsReads).toEqual([]);
+    // The .env is read only to scrub the other judge's key, never to pick this one.
+    expect(w.journal.fsReads.every((path) => path.endsWith(".env"))).toBe(true);
     expect(w.journal.requests).toHaveLength(1);
     expect(w.journal.requests[0]?.headers.Authorization).toBe("Bearer from-saved");
     expect(w.journal.requests[0]?.body.includes("from-saved")).toBe(false);
@@ -1295,11 +1451,11 @@ describe("commands", () => {
     await $.session.start(interactiveStart);
     await $.command.run(commandRun("sharing on"));
     expect(w.journal.toasts.at(-1)).toBe(
-      "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
+      "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
     );
     await $.command.run(commandRun("sharing off"));
     expect(w.journal.toasts.at(-1)).toBe(
-      "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
+      "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
     );
     expect(w.journal.asks).toHaveLength(0);
   });
@@ -1310,7 +1466,7 @@ describe("commands", () => {
     await $.command.run(commandRun("status"));
     const line = w.journal.logs.at(-1) ?? "";
     expect(line).toBe(
-      "Mode: hint. Minimum: 40,000 tokens. Budget: off. Context: 60,000 (36% of the context limit; hint floor 0.77). Key: env. No cooldown; semantic checks still apply. Claude Code auto-compacts at 167,000 tokens. Request log: off. Settings: /config (compact-adviser rows) and /compact-adviser.",
+      "Mode: hint. Judge: jev. Minimum: 40,000 tokens. Budget: off. Context: 60,000 (36% of the context limit; hint floor 0.77). Key: env. No cooldown; semantic checks still apply. Claude Code auto-compacts at 167,000 tokens. Request log: off. Settings: /config (compact-adviser rows) and /compact-adviser.",
     );
     expect(line.includes(KEY)).toBe(false);
   });
@@ -1368,7 +1524,7 @@ describe("commands", () => {
     await $.session.start(interactiveStart);
     await $.command.run(commandRun("threshold"));
     expect(w.journal.toasts.at(-1)).toBe(
-      "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
+      "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
     );
   });
 });
@@ -1385,6 +1541,7 @@ describe("settings pane", () => {
       "Minimum context 40,000 tokens",
       "Log TypeSafe requests Off",
       "TypeSafe API key from the environment",
+      "Judge TypeSafe Jev",
       "Reset minimum to 40,000",
       "Status",
       "Close",
@@ -1442,7 +1599,7 @@ describe("settings pane", () => {
     await $.ui.press({ plugin: PLUGIN, key: "menu:mode" });
     await $.ui.render(pane);
     await $.ui.press({ plugin: PLUGIN, key: "back" });
-    expect(rows(await $.ui.render(pane))).toHaveLength(7);
+    expect(rows(await $.ui.render(pane))).toHaveLength(8);
 
     await $.ui.press({ plugin: PLUGIN, key: "menu:minimum" });
     tree = await $.ui.render(pane);
@@ -1457,7 +1614,7 @@ describe("settings pane", () => {
     await $.ui.press({ plugin: PLUGIN, key: "back" });
     await drain(w);
     tree = await $.ui.render(pane);
-    expect(rows(tree)).toHaveLength(7);
+    expect(rows(tree)).toHaveLength(8);
     expect(autoFocused(tree)).toBe("menu:minimum");
     expect(w.journal.closed).toEqual([]);
   });
@@ -1502,7 +1659,7 @@ describe("settings pane", () => {
     await $.ui.press({ plugin: PLUGIN, key: "menu:status" });
     await drain(w);
     expect(text(await $.ui.render(pane))).toContain(
-      "Mode: off. Minimum: 40,000 tokens. Budget: off. Context: 60,000 (36% of the context limit; hint floor 0.77). Key: env.",
+      "Mode: off. Judge: jev. Minimum: 40,000 tokens. Budget: off. Context: 60,000 (36% of the context limit; hint floor 0.77). Key: env.",
     );
     expect(text(await $.ui.render(pane))).not.toContain("Sharing:");
     await $.ui.press({ plugin: PLUGIN, key: "menu:close" });
@@ -1615,5 +1772,252 @@ describe("settings pane", () => {
     expect(text(await $.ui.render({ ...(pane as object), requestId: "other" } as never))).toContain(
       "OTHER",
     );
+  });
+});
+
+describe("walking away", () => {
+  const MINUTE = 60_000;
+  const acknowledged = { autoAcknowledged: true };
+  // Between the idle bar (0.5) and the turn-end floor at 36% usage (0.77): no compaction at
+  // the turn end, a compaction once the person has walked away.
+  const finishedCoordinating = jevAnswer({ completed: 0.99, handsOn: 0.2 });
+  const unfinished = jevAnswer({ completed: 0.3, handsOn: 0.99 });
+
+  function awayWorld(
+    on: Parameters<typeof world>[0],
+    answer: unknown,
+    options: Parameters<typeof world>[1] = {},
+  ) {
+    const w = world(on, { mode: "auto", consent: acknowledged, ...options });
+    w.respond = async () => ({ status: 200, text: JSON.stringify(answer) });
+    return w;
+  }
+
+  async function twoTurns($: Engine, w: World) {
+    w.messages = longConversation("first ask");
+    await turn($, w, "a");
+    w.messages = longConversation("second ask");
+    await turn($, w, "b");
+  }
+
+  test("a finished checkpoint compacts once at the idle point, without asking the judge again", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.compactions).toHaveLength(0);
+    expect(w.journal.requests).toHaveLength(1);
+    await w.clock.advance(50 * MINUTE - 1000);
+    expect(w.journal.compactions).toHaveLength(0);
+    await w.clock.advance(1000);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(w.journal.forks).toHaveLength(0);
+    await w.clock.advance(5 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+  });
+
+  test("a 5-minute cache moves the idle point to 4 minutes; idleMinutes overrides both", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating, { env: { FORCE_PROMPT_CACHING_5M: "1" } });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(4 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+  });
+
+  test("idleMinutes sets the idle point", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    w.rows.set(`${PLUGIN}.idleMinutes`, 20);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(20 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+  });
+
+  test("an unfinished checkpoint keeps the cache warm each cycle until the 8-hour cap", async ($, on) => {
+    const w = awayWorld(on, unfinished, { subscription: true } as never);
+    w.subscription = true;
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    for (let i = 0; i < 12; i++) {
+      await w.clock.advance(50 * MINUTE);
+      await drain(w);
+    }
+    // Pings at 50, 100, ... 450 minutes after the last answer; the next would pass 8 hours.
+    expect(w.journal.forks).toHaveLength(9);
+    expect(w.journal.forks.every((p) => p === "Reply with exactly: OK")).toBe(true);
+    expect(w.journal.compactions).toHaveLength(0);
+    expect(w.journal.requests).toHaveLength(2);
+    expect(w.journal.statuses.filter((s) => s)).toHaveLength(0);
+    expect(w.journal.toasts).toHaveLength(0);
+  });
+
+  test("without a key for the selected judge, walking away does nothing", async ($, on) => {
+    const w = awayWorld(on, unfinished, { key: undefined });
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(3 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.requests).toHaveLength(0);
+    expect(w.journal.forks).toHaveLength(0);
+    expect(w.journal.compactions).toHaveLength(0);
+  });
+
+  test("keepWarmHours 0 turns warming off", async ($, on) => {
+    const w = awayWorld(on, unfinished);
+    w.rows.set(`${PLUGIN}.keepWarmHours`, 0);
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(3 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.forks).toHaveLength(0);
+  });
+
+  test("a ping that misses the cache stops warming", async ($, on) => {
+    const w = awayWorld(on, unfinished);
+    w.fork = async () => ({
+      isAnswered: true,
+      text: "OK",
+      usage: {
+        input_tokens: 16,
+        output_tokens: 4,
+        cache_read_input_tokens: 35000,
+        cache_creation_input_tokens: 40000,
+      },
+    });
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(4 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.forks).toHaveLength(1);
+  });
+
+  test("a fork with nothing to fork stops warming", async ($, on) => {
+    const w = awayWorld(on, unfinished);
+    w.fork = async () => ({ isAnswered: false, reason: "nothing-to-fork" });
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(4 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.forks).toHaveLength(1);
+  });
+
+  test("no ping before two exchanges", async ($, on) => {
+    const w = awayWorld(on, unfinished);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(3 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.forks).toHaveLength(0);
+    expect(w.journal.compactions).toHaveLength(0);
+  });
+
+  test("a judgment that failed at the turn end never compacts at the idle point", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    w.respond = async () => ({ status: 500, text: "{}" });
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(50 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(0);
+    expect(w.journal.forks).toHaveLength(1);
+  });
+
+  // Typing (`prompt.edit`) and a recalled or cleared box (`prompt.change`) are engine-only
+  // events the kit cannot raise; validate.mjs pins both hooks and scripts/live-e2e.mjs types.
+  for (const activity of ["a prompt", "a foreign command", "a turn"] as const) {
+    test(`${activity} before the idle point cancels it`, async ($, on) => {
+      const w = awayWorld(on, finishedCoordinating);
+      await $.session.start(interactiveStart);
+      await turnEnd($, w);
+      await w.clock.advance(10 * MINUTE);
+      if (activity === "a prompt") {
+        await $.prompt.submit({ text: "next ask", origin: { kind: "composer" } } as never);
+      } else if (activity === "a foreign command") {
+        await $.command.run(commandRun("status"));
+      } else {
+        await $.turn.start({ turnId: "next", origin: { kind: "composer" } } as never);
+      }
+      await w.clock.advance(60 * MINUTE);
+      await drain(w);
+      expect(w.journal.compactions).toHaveLength(0);
+      expect(w.journal.forks).toHaveLength(0);
+    });
+  }
+
+  test("a draft in the prompt box at the idle point counts as the person being there", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    w.draft = "half a thought";
+    await w.clock.advance(60 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(0);
+  });
+
+  for (const [name, options] of [
+    ["hint mode", { mode: "hint" }],
+    ["unconfirmed auto", { mode: "auto", consent: { autoAcknowledged: false } }],
+  ] as const) {
+    test(`${name} never acts once the person walks away`, async ($, on) => {
+      const w = world(on, options);
+      w.respond = async () => ({ status: 200, text: JSON.stringify(finishedCoordinating) });
+      await $.session.start(interactiveStart);
+      await twoTurns($, w);
+      await w.clock.advance(3 * 60 * MINUTE);
+      await drain(w);
+      expect(w.journal.compactions).toHaveLength(0);
+      expect(w.journal.forks).toHaveLength(0);
+    });
+  }
+
+  test("the before-compact prompt runs first at the idle point", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    w.rows.set(`${PLUGIN}.beforeCompactPrompt`, "Save the notes from this session.");
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(50 * MINUTE);
+    await drain(w);
+    expect(w.journal.prompts).toEqual(["Save the notes from this session."]);
+    expect(w.journal.compactions).toHaveLength(0);
+    await $.turn.start({ turnId: "before-1", text: "Notes saved." } as never);
+    await $.turn.complete({
+      answer: "Notes saved.",
+      durationMs: 1000,
+      isAborted: false,
+      turnId: "before-1",
+      reason: "answer",
+    });
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(1);
+  });
+
+  test("an acknowledgement saved before idle compaction existed asks again", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating, {
+      store: { preferences: { version: 1, autoAcknowledged: true } },
+      consent: "absent",
+    });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await w.clock.advance(60 * MINUTE);
+    await drain(w);
+    expect(w.journal.compactions).toHaveLength(0);
+    w.answers.push("Enable automatic mode");
+    await $.command.run(commandRun("auto"));
+    expect(w.journal.asks.at(-1)).toContain("walk away");
+    expect(w.journal.asks.at(-1)).toContain("prompt cache warm");
+  });
+
+  test("status says what happens once you walk away", async ($, on) => {
+    const w = awayWorld(on, finishedCoordinating);
+    w.subscription = true;
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    await $.command.run(commandRun("status"));
+    expect(w.journal.logs.at(-1)).toContain("Away: after 50 min (1 h cache)");
+    expect(w.journal.logs.at(-1)).toContain("keep-warm up to 8 h");
   });
 });

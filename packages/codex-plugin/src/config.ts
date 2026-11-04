@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { DEFAULT_JUDGE, JUDGES, type JudgeName } from "./judge.ts";
 import { parseProfile } from "./profile.ts";
 
 export type Mode = "hint" | "off";
@@ -38,8 +39,31 @@ export interface Config {
   /** Tokens at which the hint floor is fully relaxed; 0 uses the model's window. */
   contextBudgetTokens: number;
   logRequests: boolean;
+  /** Which model answers the two questions; absent means the Decisions judge. */
+  judge?: JudgeName;
   typesafeApiKey?: string;
+  openaiApiKey?: string;
   profile?: string;
+}
+
+/** The judge a configuration selects. */
+export function selectedJudge(config: Config): JudgeName {
+  return config.judge ?? DEFAULT_JUDGE;
+}
+
+/** Each judge's saved-key field and the words messages use for it. */
+export const SAVED_KEY: Readonly<
+  Record<JudgeName, { field: "openaiApiKey" | "typesafeApiKey"; label: string; article: string }>
+> = {
+  decisions: { field: "openaiApiKey", label: "OpenAI API key", article: "an" },
+  jev: { field: "typesafeApiKey", label: "TypeSafe API key", article: "a" },
+};
+
+/** A judge name, or the reason it is not one. */
+export function parseJudge(text: string): JudgeName {
+  const value = text.trim();
+  if (!JUDGES.includes(value as JudgeName)) throw new Error("Choose a judge: decisions or jev.");
+  return value as JudgeName;
 }
 
 export const DEFAULT_CONFIG: Readonly<Config> = Object.freeze({
@@ -80,11 +104,12 @@ export function parseMode(text: string): Mode {
   return value as Mode;
 }
 
-export function parseSavedApiKey(text: string): string {
+export function parseSavedApiKey(text: string, judge: JudgeName = "jev"): string {
   const value = text.trim();
-  if (!value) throw new Error("Enter a TypeSafe API key, or cancel to leave it unchanged.");
+  const { label, article } = SAVED_KEY[judge];
+  if (!value) throw new Error(`Enter ${article} ${label}, or cancel to leave it unchanged.`);
   if (value.length > MAX_SAVED_API_KEY_LENGTH) {
-    throw new Error("That value is too long to save as a TypeSafe API key.");
+    throw new Error(`That value is too long to save as ${article} ${label}.`);
   }
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
@@ -112,16 +137,22 @@ export function validateConfig(value: unknown): Config {
         !Number.isSafeInteger(c.contextBudgetTokens) ||
         c.contextBudgetTokens < 0)) ||
     (c.logRequests !== undefined && typeof c.logRequests !== "boolean") ||
-    (c.typesafeApiKey !== undefined && typeof c.typesafeApiKey !== "string")
+    (c.typesafeApiKey !== undefined && typeof c.typesafeApiKey !== "string") ||
+    (c.openaiApiKey !== undefined && typeof c.openaiApiKey !== "string") ||
+    (c.judge !== undefined && !JUDGES.includes(c.judge as JudgeName))
   ) {
     throw new Error("Invalid or unsupported settings. Restore a valid version-1 configuration.");
   }
-  parseProfile(c.profile);
-  const typesafeApiKey =
-    typeof c.typesafeApiKey === "string" && c.typesafeApiKey.trim() !== ""
-      ? c.typesafeApiKey.trim()
-      : undefined;
-  if (typesafeApiKey !== undefined && typesafeApiKey.length > MAX_SAVED_API_KEY_LENGTH) {
+  const judge = c.judge as JudgeName | undefined;
+  parseProfile(c.profile, judge ?? DEFAULT_JUDGE);
+  const savedKey = (value: unknown) =>
+    typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+  const typesafeApiKey = savedKey(c.typesafeApiKey);
+  const openaiApiKey = savedKey(c.openaiApiKey);
+  if (
+    (typesafeApiKey !== undefined && typesafeApiKey.length > MAX_SAVED_API_KEY_LENGTH) ||
+    (openaiApiKey !== undefined && openaiApiKey.length > MAX_SAVED_API_KEY_LENGTH)
+  ) {
     throw new Error("Invalid or unsupported settings. Restore a valid version-1 configuration.");
   }
   return {
@@ -130,7 +161,9 @@ export function validateConfig(value: unknown): Config {
     minContextTokens: c.minContextTokens,
     contextBudgetTokens: (c.contextBudgetTokens as number | undefined) ?? 0,
     logRequests: c.logRequests === true,
+    ...(judge !== undefined ? { judge } : {}),
     ...(typesafeApiKey !== undefined ? { typesafeApiKey } : {}),
+    ...(openaiApiKey !== undefined ? { openaiApiKey } : {}),
     ...(c.profile !== undefined ? { profile: c.profile as string } : {}),
   };
 }
@@ -142,25 +175,40 @@ export class ConfigStore {
   }
 
   read(): Config {
+    return this.load(validateConfig);
+  }
+
+  /**
+   * The stored fields, merged with the patch and validated as a whole. Validating the merge,
+   * not the stored file first, lets a patch repair a field that made the file invalid (such
+   * as `judge: "jev"` for a Jev-only profile); fields it does not touch must still be valid.
+   */
+  update(patch: Partial<Omit<Config, "version">>): Config {
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+    const stored = this.load((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Invalid settings.");
+      }
+      return value as Record<string, unknown>;
+    });
+    const config = validateConfig({ ...stored, ...patch });
+    writeAtomic(this.path, `${JSON.stringify(config, null, 2)}\n`);
+    return config;
+  }
+
+  private load<T>(parse: (value: unknown) => T): T {
     try {
       const stat = lstatSync(this.path);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_SETTINGS_BYTES) {
         throw new Error("Unsafe settings file.");
       }
-      return validateConfig(JSON.parse(readFileSync(this.path, "utf8")));
+      return parse(JSON.parse(readFileSync(this.path, "utf8")));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...DEFAULT_CONFIG };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return parse({ ...DEFAULT_CONFIG });
       throw new Error("Cannot read compact-adviser settings; no advice is given.", {
         cause: error,
       });
     }
-  }
-
-  update(patch: Partial<Omit<Config, "version">>): Config {
-    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    const config = validateConfig({ ...this.read(), ...patch });
-    writeAtomic(this.path, `${JSON.stringify(config, null, 2)}\n`);
-    return config;
   }
 }
 

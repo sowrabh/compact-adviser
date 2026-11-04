@@ -2,7 +2,7 @@
 
 A profile is a JSON object that changes judge questions or decision thresholds.
 Use a profile to evaluate a session-specific policy without changing the shipped defaults.
-The runtime judge remains TypeSafe Jev on every host.
+A profile cannot choose the judge; the `judge` setting does. `floors` and `coordinationWeight` apply to either judge, and a profile's `floors` replace the selected judge's own schedule.
 An empty or absent `profile` setting uses the shipped policy.
 
 Keep `mode` set to `hint` while evaluating a profile.
@@ -39,7 +39,7 @@ Usage values must strictly increase, and floors must not increase.
 Every value must be between zero and one.
 The same host-specific usage denominator applies with and without a profile, and a context budget, when set, replaces it in both cases whenever the budget is smaller or the host limit is unknown.
 
-The optional `questions` field replaces both questions in full.
+The optional `questions` field replaces both questions in full, for the `jev` judge only. While the `decisions` judge is selected, a profile that carries `questions` is invalid and disables advice; Jev's choice questions are never sent to Decisions, whose predicates are fixed.
 It has the same structure as `QUESTIONS` in `packages/pi-extension/src/judge.ts`.
 Only the instruction and criterion text can change.
 Keep `type: "choice"`, both question keys, and all criterion keys:

@@ -9,6 +9,7 @@ import { type MockClock, mock } from "claude-code/testing";
 
 export const PLUGIN = "compact-adviser";
 export const KEY = "tsk-fixture-key-1234567890";
+export const OPENAI_KEY = "sk-openai-fixture-key-0987654321";
 export const SESSION = "session-1";
 export const START = 1_000_000;
 
@@ -24,6 +25,7 @@ export type Journal = {
   configSets: { key: string; value: unknown }[];
   requests: { url: string; headers: Record<string, string>; body: string }[];
   compactions: { instructions?: string }[];
+  forks: string[];
   prompts: string[];
   ranCommands: { command: string; args?: string }[];
   messageReads: number;
@@ -58,6 +60,24 @@ export function jevAnswer(v: Verdict = {}) {
   };
 }
 
+/** A Decisions reply: one probability per predicate. */
+export function decisionsAnswer(v: Verdict = {}) {
+  return {
+    model: "gpt-6-luna",
+    answers: [
+      { type: "predicate", name: "finished", probability: v.completed ?? 0.99 },
+      { type: "predicate", name: "hands_on", probability: v.handsOn ?? 0.99 },
+    ],
+    usage: {
+      input_tokens: 8200,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      output_tokens: 0,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 8200,
+    },
+  };
+}
+
 export type World = {
   clock: MockClock;
   store: Map<string, unknown>;
@@ -75,6 +95,12 @@ export type World = {
   messages: SessionMessage[];
   /** What TypeSafe answers; the default is a confident checkpoint. */
   respond: (body: string) => Promise<{ status: number; text: string } | { deny: string }>;
+  /** What a keep-warm `$.model.fork` answers; the default is a full cache hit. */
+  fork: () => Promise<unknown>;
+  /** The prompt box's draft at `$.prompt.read()`. */
+  draft: string;
+  /** Rate-limit windows on the latest reply, as a subscription reports them. */
+  subscription: boolean;
   /** What the engine's compaction answers for this mod's own request. */
   compact: () => Promise<
     { messages: SessionMessage[]; tokensBefore?: number; tokensAfter?: number } | { skip: string }
@@ -91,6 +117,13 @@ export type WorldOptions = {
   /** The `COMPACT_ADVISER_DISABLE` kill switch; omit to leave the variable unset. */
   disable?: string;
   key?: string | undefined;
+  /** `OPENAI_DECISIONS_API_KEY` in the launch environment; omit to leave it unset. */
+  openaiKey?: string;
+  /** The `judge` row; "absent" leaves it to the manifest default. Upstream's suites run as Jev. */
+  judge?: "decisions" | "jev" | "absent" | string;
+  savedOpenaiKey?: string;
+  /** More launch-environment variables, such as the prompt-cache switches. */
+  env?: Record<string, string>;
   endpoint?: string;
   /** The `TYPESAFE_BASE` override; omit to leave the variable unset. */
   base?: string;
@@ -140,15 +173,17 @@ export function world(on: On, options: WorldOptions = {}): World {
     HOME: "/tmp/fixture-home",
     ...(functionHooks === undefined ? {} : { CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: functionHooks }),
     ...(key === undefined ? {} : { TYPESAFE_API_KEY: key }),
+    ...(options.openaiKey === undefined ? {} : { OPENAI_DECISIONS_API_KEY: options.openaiKey }),
     ...(options.endpoint === undefined ? {} : { COMPACT_ADVISER_TEST_ENDPOINT: options.endpoint }),
     ...(options.disable === undefined ? {} : { COMPACT_ADVISER_DISABLE: options.disable }),
     ...(options.base === undefined ? {} : { TYPESAFE_BASE: options.base }),
+    ...(options.env ?? {}),
   });
   const consent = "consent" in options ? options.consent : "absent";
   // The plugin store, in memory and visible to the test.
   const store = new Map<string, unknown>(
     Object.entries({
-      ...(consent === "absent" ? {} : { preferences: { version: 1, ...(consent as object) } }),
+      ...(consent === "absent" ? {} : { preferences: { version: 2, ...(consent as object) } }),
       ...(options.store ?? {}),
     }),
   );
@@ -175,6 +210,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     configSets: [],
     requests: [],
     compactions: [],
+    forks: [],
     prompts: [],
     ranCommands: [],
     messageReads: 0,
@@ -188,7 +224,10 @@ export function world(on: On, options: WorldOptions = {}): World {
     [`${PLUGIN}.minContextTokens`, options.minimum ?? 40000],
     [`${PLUGIN}.logRequests`, options.logRequests ?? false],
     [`${PLUGIN}.typesafeApiKey`, options.savedKey ?? ""],
+    [`${PLUGIN}.openaiApiKey`, options.savedOpenaiKey ?? ""],
   ]);
+  const judge = options.judge ?? "jev";
+  if (judge !== "absent") rows.set(`${PLUGIN}.judge`, judge);
   let configDenial: string | undefined;
   const w: World = {
     clock,
@@ -199,12 +238,29 @@ export function world(on: On, options: WorldOptions = {}): World {
     answers: [],
     usage: { tokens: 60000, window: 200000, autoCompactThreshold: 167000 },
     messages: longConversation(),
-    respond: async () => ({ status: 200, text: JSON.stringify(jevAnswer()) }),
+    respond: async (body) => ({
+      status: 200,
+      text: JSON.stringify(
+        JSON.parse(body).model === "gpt-6-luna" ? decisionsAnswer() : jevAnswer(),
+      ),
+    }),
     compact: async () => ({
       messages: [{ role: "user", text: "This session is being continued", toolUses: [] }],
       tokensBefore: 60000,
       tokensAfter: 3300,
     }),
+    fork: async () => ({
+      isAnswered: true,
+      text: "OK",
+      usage: {
+        input_tokens: 16,
+        output_tokens: 4,
+        cache_read_input_tokens: 75000,
+        cache_creation_input_tokens: 5,
+      },
+    }),
+    draft: "",
+    subscription: false,
     denyConfig: (reason) => {
       configDenial = reason;
     },
@@ -242,7 +298,10 @@ export function world(on: On, options: WorldOptions = {}): World {
         apiUsage: null,
       };
     }
-    return { value: { context, rateLimits: [] } as never };
+    const rateLimits = w.subscription
+      ? [{ kind: "five_hour", percentUsed: 10, resetsAt: START + 3_600_000 }]
+      : [];
+    return { value: { context, rateLimits } as never };
   });
   on("session.messages", async () => {
     journal.messageReads += 1;
@@ -328,7 +387,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   });
   on("ui.open", async (_$, e) => {
     journal.opened.push({ id: e.id, focus: e.focus });
-    return { value: undefined };
+    return { value: { isPlaced: true as const } };
   });
   on("ui.close", async (_$, e) => {
     journal.closed.push(e.id);
@@ -358,6 +417,16 @@ export function world(on: On, options: WorldOptions = {}): World {
       jsonlFiles.set(write.path, write.text);
     return { value: undefined };
   });
+  on("model.fork", async (_$, e) => {
+    journal.forks.push(e.prompt);
+    return { value: (await w.fork()) as never };
+  });
+  on("prompt.read", async () => ({ value: { text: w.draft, cursor: w.draft.length } }));
+  on(
+    "prompt.edit",
+    async (_$, e) => ({ text: e.text + e.inputText, cursor: e.cursor + 1 }) as never,
+  );
+  on("prompt.change", async (_$, e) => ({ text: e.text }));
   on("http.fetch", async (_$, e) => {
     const init = (e.init ?? {}) as { headers?: Record<string, string>; body?: string };
     journal.requests.push({ url: e.url, headers: init.headers ?? {}, body: init.body ?? "" });

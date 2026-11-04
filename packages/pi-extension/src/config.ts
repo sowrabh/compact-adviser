@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { lockSync } from "proper-lockfile";
+import { DEFAULT_JUDGE, JUDGES, type JudgeName } from "./judge.ts";
 import { parseProfile } from "./profile.ts";
 
 export type Mode = "hint" | "auto" | "off";
@@ -23,9 +24,44 @@ export interface Config {
   /** Tokens at which the hint floor is fully relaxed; 0 uses the model's window. */
   contextBudgetTokens: number;
   autoAcknowledged: boolean;
+  /**
+   * 2 once automatic mode was acknowledged with walk-away compaction in its disclosure; an
+   * acknowledgement without it predates that and does not confirm auto.
+   */
+  consentVersion?: 2;
   logRequests: boolean;
+  /** Minutes after a settled answer before walk-away compaction; 0 follows the cache TTL. */
+  idleMinutes?: number;
+  /** Which model answers the two questions; absent means the Decisions judge. */
+  judge?: JudgeName;
   typesafeApiKey?: string;
+  openaiApiKey?: string;
   profile?: string;
+}
+
+/** The judge a configuration selects. */
+export function selectedJudge(config: Config): JudgeName {
+  return config.judge ?? DEFAULT_JUDGE;
+}
+
+/** Whether automatic mode was acknowledged with its current disclosure. */
+export function autoConfirmed(config: Config): boolean {
+  return config.autoAcknowledged && config.consentVersion === 2;
+}
+
+/** Each judge's saved-key field and the words the menu and messages use for it. */
+export const SAVED_KEY: Readonly<
+  Record<JudgeName, { field: "openaiApiKey" | "typesafeApiKey"; label: string; article: string }>
+> = {
+  decisions: { field: "openaiApiKey", label: "OpenAI API key", article: "an" },
+  jev: { field: "typesafeApiKey", label: "TypeSafe API key", article: "a" },
+};
+
+/** A judge name, or the reason it is not one. */
+export function parseJudge(text: string): JudgeName {
+  const value = text.trim();
+  if (!JUDGES.includes(value as JudgeName)) throw new Error("Choose a judge: decisions or jev.");
+  return value as JudgeName;
 }
 export const DEFAULT_CONFIG: Readonly<Config> = Object.freeze({
   version: 1,
@@ -53,11 +89,12 @@ export function parseBudget(text: string): number {
   }
   return number;
 }
-export function parseSavedApiKey(text: string): string {
+export function parseSavedApiKey(text: string, judge: JudgeName = "jev"): string {
   const value = text.trim();
-  if (!value) throw new Error("Enter a TypeSafe API key, or cancel to leave it unchanged.");
+  const { label, article } = SAVED_KEY[judge];
+  if (!value) throw new Error(`Enter ${article} ${label}, or cancel to leave it unchanged.`);
   if (value.length > MAX_SAVED_API_KEY_LENGTH) {
-    throw new Error("That value is too long to save as a TypeSafe API key.");
+    throw new Error(`That value is too long to save as ${article} ${label}.`);
   }
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
@@ -83,16 +120,25 @@ function validate(value: unknown): Config {
         c.contextBudgetTokens < 0)) ||
     typeof c.autoAcknowledged !== "boolean" ||
     (c.logRequests !== undefined && typeof c.logRequests !== "boolean") ||
-    (c.typesafeApiKey !== undefined && typeof c.typesafeApiKey !== "string")
+    (c.typesafeApiKey !== undefined && typeof c.typesafeApiKey !== "string") ||
+    (c.openaiApiKey !== undefined && typeof c.openaiApiKey !== "string") ||
+    (c.judge !== undefined && !JUDGES.includes(c.judge as JudgeName)) ||
+    (c.consentVersion !== undefined && c.consentVersion !== 2) ||
+    (c.idleMinutes !== undefined &&
+      (typeof c.idleMinutes !== "number" || !Number.isFinite(c.idleMinutes) || c.idleMinutes < 0))
   ) {
     throw new Error("Invalid or unsupported settings. Restore a valid version-1 configuration.");
   }
-  parseProfile(c.profile);
-  const typesafeApiKey =
-    typeof c.typesafeApiKey === "string" && c.typesafeApiKey.trim() !== ""
-      ? c.typesafeApiKey.trim()
-      : undefined;
-  if (typesafeApiKey !== undefined && typesafeApiKey.length > MAX_SAVED_API_KEY_LENGTH) {
+  const judge = c.judge as JudgeName | undefined;
+  parseProfile(c.profile, judge ?? DEFAULT_JUDGE);
+  const savedKey = (value: unknown) =>
+    typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+  const typesafeApiKey = savedKey(c.typesafeApiKey);
+  const openaiApiKey = savedKey(c.openaiApiKey);
+  if (
+    (typesafeApiKey !== undefined && typesafeApiKey.length > MAX_SAVED_API_KEY_LENGTH) ||
+    (openaiApiKey !== undefined && openaiApiKey.length > MAX_SAVED_API_KEY_LENGTH)
+  ) {
     throw new Error("Invalid or unsupported settings. Restore a valid version-1 configuration.");
   }
   return {
@@ -101,8 +147,12 @@ function validate(value: unknown): Config {
     minContextTokens: c.minContextTokens,
     contextBudgetTokens: (c.contextBudgetTokens as number | undefined) ?? 0,
     autoAcknowledged: c.autoAcknowledged,
+    ...(c.consentVersion === 2 ? { consentVersion: 2 as const } : {}),
     logRequests: c.logRequests === true,
+    ...(typeof c.idleMinutes === "number" ? { idleMinutes: c.idleMinutes } : {}),
+    ...(judge !== undefined ? { judge } : {}),
     ...(typesafeApiKey !== undefined ? { typesafeApiKey } : {}),
+    ...(openaiApiKey !== undefined ? { openaiApiKey } : {}),
     ...(c.profile !== undefined ? { profile: c.profile as string } : {}),
   };
 }
@@ -112,13 +162,16 @@ export class ConfigStore {
     this.path = join(agentDir, "compact-adviser.json");
   }
   read(): Config {
+    return this.load(validate);
+  }
+  private load<T>(parse: (value: unknown) => T): T {
     try {
       const stat = lstatSync(this.path);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16384)
         throw new Error("Unsafe settings file.");
-      return validate(JSON.parse(readFileSync(this.path, "utf8")));
+      return parse(JSON.parse(readFileSync(this.path, "utf8")));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...DEFAULT_CONFIG };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return parse({ ...DEFAULT_CONFIG });
       throw new Error("Cannot read compact-adviser settings; automatic action is disabled.", {
         cause: error,
       });
@@ -131,7 +184,15 @@ export class ConfigStore {
     const release = lockSync(this.path, { realpath: false, stale: 10000 });
     const temp = `${this.path}.${randomUUID()}.tmp`;
     try {
-      const config = validate({ ...this.read(), ...patch });
+      // Validate the merge, not the stored file first, so a patch can repair the field that
+      // made the file invalid (such as `judge: "jev"` for a Jev-only profile); fields it does
+      // not touch must still be valid.
+      const stored = this.load((value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+          throw new Error("Invalid settings.");
+        return value as Record<string, unknown>;
+      });
+      const config = validate({ ...stored, ...patch });
       const fd = openSync(temp, "wx", 0o600);
       try {
         writeFileSync(fd, `${JSON.stringify(config, null, 2)}\n`);

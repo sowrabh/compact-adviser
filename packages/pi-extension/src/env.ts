@@ -4,11 +4,13 @@ import { join } from "node:path";
 const NAME = "TYPESAFE_API_KEY";
 const PREFIX = /^(?:export|declare\s+-x)\s+/;
 
-export type TypesafeKeySource = "env" | "saved" | ".env" | "missing";
-export interface ResolvedTypesafeApiKey {
+export type KeySource = "env" | "saved" | ".env" | "missing";
+export interface ResolvedApiKey {
   value: string | undefined;
-  source: TypesafeKeySource;
+  source: KeySource;
 }
+export type TypesafeKeySource = KeySource;
+export type ResolvedTypesafeApiKey = ResolvedApiKey;
 
 function unquote(value: string): string {
   if (value.length >= 2) {
@@ -38,20 +40,21 @@ function nonempty(value: string | undefined): string | undefined {
 }
 
 /**
- * Process env (non-empty) wins, then a menu-saved key, then `TYPESAFE_API_KEY`
- * from `.env` in `cwd`. A missing file is ignored; the value is never logged.
+ * Process env (non-empty) wins, then a menu-saved key, then `name` from `.env` in `cwd`.
+ * A missing file is ignored; the value is never logged.
  */
-export function resolveTypesafeApiKey(
+export function resolveApiKey(
+  name: string,
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
   saved?: string,
-): ResolvedTypesafeApiKey {
-  const fromEnv = nonempty(env.TYPESAFE_API_KEY);
+): ResolvedApiKey {
+  const fromEnv = nonempty(env[name]);
   if (fromEnv !== undefined) return { value: fromEnv, source: "env" };
   const fromSaved = nonempty(saved);
   if (fromSaved !== undefined) return { value: fromSaved, source: "saved" };
   try {
-    const fromFile = nonempty(parseDotenvKey(readFileSync(join(cwd, ".env"), "utf8"), NAME));
+    const fromFile = nonempty(parseDotenvKey(readFileSync(join(cwd, ".env"), "utf8"), name));
     if (fromFile !== undefined) return { value: fromFile, source: ".env" };
   } catch {
     // A missing or unreadable .env is ignored.
@@ -59,6 +62,15 @@ export function resolveTypesafeApiKey(
   return { value: undefined, source: "missing" };
 }
 
-export function formatKeyStatus(source: TypesafeKeySource): string {
+/** The Jev key: `TYPESAFE_API_KEY` from the process, a saved key, or a cwd `.env`. */
+export function resolveTypesafeApiKey(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+  saved?: string,
+): ResolvedTypesafeApiKey {
+  return resolveApiKey(NAME, env, cwd, saved);
+}
+
+export function formatKeyStatus(source: KeySource): string {
   return `Key: ${source}`;
 }

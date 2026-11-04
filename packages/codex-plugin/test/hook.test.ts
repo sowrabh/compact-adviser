@@ -39,6 +39,8 @@ function stop(lab: Lab, overrides: Partial<HookPayload> = {}): HookPayload {
 
 async function withLab(body: (lab: Lab) => Promise<void>): Promise<void> {
   const lab = makeLab();
+  // Upstream's suites run as the Jev judge; the Decisions default has its own tests.
+  new ConfigStore(adviserRoot({ CODEX_HOME: lab.home })).update({ judge: "jev" } as never);
   try {
     await body(lab);
   } finally {
@@ -510,4 +512,125 @@ test("an unknown hook event does nothing at all", async () => {
       {},
     );
   });
+});
+
+function decisionsReply(finished = 0.99, handsOn = 0.99): unknown {
+  return {
+    model: "gpt-6-luna",
+    answers: [
+      { type: "predicate", name: "finished", probability: finished },
+      { type: "predicate", name: "hands_on", probability: handsOn },
+    ],
+    usage: {
+      input_tokens: 8200,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      output_tokens: 0,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 8200,
+    },
+  };
+}
+
+test("Decisions is the default judge: its own key, endpoint and predicates", async () => {
+  const lab = makeLab();
+  try {
+    writeRollout(lab.transcript, settledRollout());
+    const judge = fakeTypesafe(() => ({ body: decisionsReply() }));
+    const env = {
+      CODEX_HOME: lab.home,
+      TYPESAFE_API_KEY: TYPESAFE_KEY,
+      OPENAI_DECISIONS_API_KEY: "sk-openai-fixture",
+    };
+    const output = await handle(stop(lab), environment(lab, { env, fetch: judge.fetch }));
+    assert.deepEqual(output, { systemMessage: HINT });
+    assert.equal(judge.requests.length, 1);
+    assert.equal(judge.requests[0]?.url, "https://api.openai.com/v1/decisions");
+    assert.equal(judge.requests[0]?.authorization, "Bearer sk-openai-fixture");
+    const body = judge.requests[0]?.body as { model: string; questions: { name: string }[] };
+    assert.equal(body.model, "gpt-6-luna");
+    assert.deepEqual(
+      body.questions.map((q) => q.name),
+      ["finished", "hands_on"],
+    );
+    for (const secret of ["sk-openai-fixture", TYPESAFE_KEY])
+      assert.ok(!JSON.stringify(body).includes(secret));
+  } finally {
+    lab.cleanup();
+  }
+});
+
+test("no substitution: Decisions without its key asks nobody, even with a TypeSafe key", async () => {
+  const lab = makeLab();
+  try {
+    writeRollout(lab.transcript, settledRollout());
+    const judge = fakeTypesafe(() => ({ body: decisionsReply() }));
+    const output = await handle(stop(lab), environment(lab, { fetch: judge.fetch }));
+    assert.deepEqual(output, {});
+    assert.equal(judge.requests.length, 0);
+  } finally {
+    lab.cleanup();
+  }
+});
+
+test("a Decisions refusal stays silent and backs off", async () => {
+  const lab = makeLab();
+  try {
+    writeRollout(lab.transcript, settledRollout());
+    const refused = decisionsReply() as { answers: unknown[] };
+    refused.answers[1] = { type: "refusal", name: "hands_on" };
+    const judge = fakeTypesafe(() => ({ body: refused }));
+    const env = { CODEX_HOME: lab.home, OPENAI_DECISIONS_API_KEY: "sk-openai-fixture" };
+    const output = await handle(stop(lab), environment(lab, { env, fetch: judge.fetch }));
+    assert.deepEqual(output, {});
+    const record = new SessionStore(adviserRoot(env)).read("s1", 1_000_000).state;
+    assert.ok(record.retryAfter > 1_000_000);
+  } finally {
+    lab.cleanup();
+  }
+});
+
+test("the other judge's key in the environment never reaches the selected judge", async () => {
+  const lab = makeLab();
+  try {
+    writeRollout(lab.transcript, settledRollout());
+    const rollout = readFileSync(lab.transcript, "utf8").replace(
+      "Done: the parser",
+      "Use tsk-env-only-secret elsewhere. Done: the parser",
+    );
+    writeFileSync(lab.transcript, rollout);
+    const judge = fakeTypesafe(() => ({ body: decisionsReply() }));
+    const env = {
+      CODEX_HOME: lab.home,
+      TYPESAFE_API_KEY: "tsk-env-only-secret",
+      OPENAI_DECISIONS_API_KEY: "sk-openai-fixture",
+    };
+    await handle(stop(lab), environment(lab, { env, fetch: judge.fetch }));
+    assert.equal(judge.requests.length, 1);
+    assert.ok(rollout.includes("tsk-env-only-secret"));
+    assert.ok(!JSON.stringify(judge.requests[0]?.body).includes("tsk-env-only-secret"));
+  } finally {
+    lab.cleanup();
+  }
+});
+
+test("the other judge's key from a cwd .env never reaches the selected judge", async () => {
+  const lab = makeLab();
+  try {
+    writeRollout(lab.transcript, settledRollout());
+    writeFileSync(
+      lab.transcript,
+      readFileSync(lab.transcript, "utf8").replace(
+        "Done: the parser",
+        "Use tsk-dotenv-only-secret elsewhere. Done: the parser",
+      ),
+    );
+    writeFileSync(`${lab.cwd}/.env`, "TYPESAFE_API_KEY=tsk-dotenv-only-secret\n");
+    const judge = fakeTypesafe(() => ({ body: decisionsReply() }));
+    const env = { CODEX_HOME: lab.home, OPENAI_DECISIONS_API_KEY: "sk-openai-fixture" };
+    await handle(stop(lab), environment(lab, { env, fetch: judge.fetch }));
+    assert.equal(judge.requests.length, 1);
+    assert.ok(!JSON.stringify(judge.requests[0]?.body).includes("tsk-dotenv-only-secret"));
+  } finally {
+    lab.cleanup();
+  }
 });

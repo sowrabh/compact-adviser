@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   release-please:
+    # Upstream's release and PR gate; this fork publishes nothing and takes no outside PRs.
+    if: github.repository == 'kunchenguid/compact-adviser'
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4

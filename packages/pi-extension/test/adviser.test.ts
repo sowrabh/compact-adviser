@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import test, { type TestContext } from "node:test";
 import {
+  DECISIONS_ENDPOINT,
   ENDPOINT,
   JUDGE_UNAVAILABLE_MESSAGE,
   JudgeError,
@@ -250,7 +251,7 @@ test("auto requires explicit confirmation, persist, and never compact on selecti
     h.notifications
       .at(-1)
       ?.includes(
-        "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
+        "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
       ),
   );
   await h.command("hint");
@@ -690,4 +691,247 @@ test("COMPACT_ADVISER_DISABLE leaves the session alone when it is falsy or unset
     assert.equal(h.calls, 1, String(value));
     assert.ok(showedHint(h), String(value));
   }
+});
+
+function decisionsReply(finished = 0.99, handsOn = 0.99) {
+  return {
+    model: "gpt-6-luna",
+    answers: [
+      { type: "predicate", name: "finished", probability: finished },
+      { type: "predicate", name: "hands_on", probability: handsOn },
+    ],
+    usage: {
+      input_tokens: 8200,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      output_tokens: 0,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 8200,
+    },
+  };
+}
+
+function withEnv(t: TestContext, values: Record<string, string | undefined>) {
+  const previous = Object.fromEntries(Object.keys(values).map((k) => [k, process.env[k]]));
+  for (const [k, v] of Object.entries(values)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  t.after(() => {
+    for (const [k, v] of Object.entries(previous)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+}
+
+function stubFetch(t: TestContext, reply: unknown) {
+  const previous = globalThis.fetch;
+  const requests: { url: string; headers: Record<string, string>; body: string }[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requests.push({
+      url: String(input),
+      headers: (init?.headers ?? {}) as Record<string, string>,
+      body: String(init?.body ?? ""),
+    });
+    return new Response(JSON.stringify(reply), { status: 200 });
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  return requests;
+}
+
+test("Decisions is the default judge: its own key, endpoint and predicates", async (t) => {
+  withEnv(t, { OPENAI_DECISIONS_API_KEY: "sk-openai-fixture", TYPESAFE_API_KEY: "tsk-fixture" });
+  const requests = stubFetch(t, decisionsReply());
+  const h = harness(t);
+  writeFileSync(
+    h.store.path,
+    JSON.stringify({ version: 1, mode: "hint", minContextTokens: 40000, autoAcknowledged: false }),
+  );
+  h.install("0.82.0", false, true);
+  await h.fire("agent_settled");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.url, DECISIONS_ENDPOINT);
+  assert.equal(requests[0]?.headers.Authorization, "Bearer sk-openai-fixture");
+  const body = JSON.parse(requests[0]?.body ?? "{}");
+  assert.equal(body.model, "gpt-6-luna");
+  assert.deepEqual(
+    body.questions.map((q: { name: string }) => q.name),
+    ["finished", "hands_on"],
+  );
+  assert.ok(!requests[0]?.body.includes("sk-openai-fixture"));
+  assert.ok(!requests[0]?.body.includes("tsk-fixture"));
+  assert.ok(showedHint(h));
+});
+
+test("no substitution: Decisions without its key asks nobody, even with a TypeSafe key", async (t) => {
+  withEnv(t, { OPENAI_DECISIONS_API_KEY: undefined, TYPESAFE_API_KEY: "tsk-fixture" });
+  const requests = stubFetch(t, decisionsReply());
+  const h = harness(t);
+  h.store.update({ judge: "decisions" } as never);
+  h.install("0.82.0", false, true);
+  await h.fire("agent_settled");
+  assert.equal(requests.length, 0);
+  assert.ok(!showedHint(h));
+});
+
+test("a Decisions refusal leaves context alone and names OpenAI", async (t) => {
+  withEnv(t, { OPENAI_DECISIONS_API_KEY: "sk-openai-fixture" });
+  const refused = decisionsReply();
+  refused.answers[1] = { type: "refusal", name: "hands_on" } as never;
+  stubFetch(t, refused);
+  const h = harness(t);
+  h.store.update({ judge: "decisions" } as never);
+  h.install("0.82.0", false, true);
+  h.enable("auto");
+  await h.fire("agent_settled");
+  assert.ok(!showedHint(h));
+  assert.equal(h.compactions.length, 0);
+  assert.ok(
+    h.notifications.some((n) => n.includes("OpenAI (Decisions)") && n.includes("declined")),
+  );
+});
+
+test("the judge command saves a judge, refuses others, and status names it", async (t) => {
+  const h = harness(t);
+  await h.command("judge decisions");
+  assert.equal((h.store.read() as { judge?: string }).judge, "decisions");
+  await h.command("judge gemini");
+  assert.equal((h.store.read() as { judge?: string }).judge, "decisions");
+  assert.ok(h.notifications.some((n) => n.includes("decisions or jev")));
+  await h.command("status");
+  assert.ok(h.notifications.at(-1)?.includes("Judge: decisions."));
+});
+
+test("Jev questions in a profile disable advice while Decisions is selected", async (t) => {
+  withEnv(t, { OPENAI_DECISIONS_API_KEY: "sk-openai-fixture" });
+  const requests = stubFetch(t, decisionsReply());
+  const h = harness(t);
+  const { QUESTIONS } = await import("../src/judge.ts");
+  writeFileSync(
+    h.store.path,
+    JSON.stringify({
+      version: 1,
+      mode: "hint",
+      minContextTokens: 40000,
+      autoAcknowledged: false,
+      judge: "decisions",
+      profile: JSON.stringify({
+        version: 1,
+        coordinationWeight: 0.5,
+        floors: [[0, 0.5]],
+        questions: QUESTIONS,
+      }),
+    }),
+  );
+  h.install("0.82.0", false, true);
+  await h.fire("agent_settled");
+  assert.equal(requests.length, 0);
+  assert.ok(!showedHint(h));
+});
+
+function judgment(finished: number, handsOn: number) {
+  return parseJudgment(apiResponse(finished, handsOn));
+}
+
+test("walking away from a finished checkpoint compacts at the idle point, without a second judgment", async (t) => {
+  // 0.99 x (0.5 + 0.5 x 0.2) = 0.594: under the 16%-usage floor, over the 0.5 idle bar.
+  const h = harness(t, async () => judgment(0.99, 0.2));
+  h.enable("auto");
+  await h.fire("agent_settled");
+  assert.equal(h.compactions.length, 0);
+  assert.equal(h.calls, 1);
+  assert.deepEqual(
+    h.timers.map((timer) => timer.ms),
+    [50 * 60_000],
+  );
+  await h.elapse();
+  assert.equal(h.compactions.length, 1);
+  assert.equal(h.calls, 1);
+});
+
+test("an unfinished checkpoint, hint mode, or a failed judgment never compacts at the idle point", async (t) => {
+  for (const [mode, evaluate] of [
+    ["auto", async () => judgment(0.3, 1)],
+    ["hint", async () => judgment(0.99, 0.2)],
+    [
+      "auto",
+      async () => {
+        throw new JudgeError("server");
+      },
+    ],
+  ] as const) {
+    const h = harness(t, evaluate as never);
+    h.enable(mode);
+    await h.fire("agent_settled");
+    await h.elapse();
+    assert.equal(h.compactions.length, 0, mode);
+  }
+});
+
+test("typing, a draft, or new input before the idle point cancels it", async (t) => {
+  for (const activity of ["typing", "draft", "input"] as const) {
+    const h = harness(t, async () => judgment(0.99, 0.2));
+    h.enable("auto");
+    await h.fire("session_start");
+    await h.fire("agent_settled");
+    if (activity === "typing") h.type();
+    else if (activity === "draft") h.editorText = "half a thought";
+    else await h.fire("input", { type: "input", text: "next", source: "interactive" });
+    await h.elapse();
+    assert.equal(h.compactions.length, 0, activity);
+  }
+});
+
+test("idleMinutes and Pi's cache retention set the idle point", async (t) => {
+  const h = harness(t, async () => judgment(0.99, 0.2));
+  h.enable("auto");
+  h.store.update({ idleMinutes: 15 } as never);
+  await h.fire("agent_settled");
+  assert.deepEqual(
+    h.timers.map((timer) => timer.ms),
+    [15 * 60_000],
+  );
+});
+
+test("an acknowledgement saved before walk-away compaction existed does not confirm auto", async (t) => {
+  const h = harness(t, async () => judgment(0.99, 0.99));
+  h.store.update({ mode: "auto", autoAcknowledged: true });
+  await h.fire("agent_settled");
+  await h.elapse();
+  assert.equal(h.compactions.length, 0);
+  h.confirms.push(true);
+  await h.command("auto");
+  assert.equal((h.store.read() as { consentVersion?: number }).consentVersion, 2);
+});
+
+test("the other judge's key in the environment never reaches the selected judge", async (t) => {
+  withEnv(t, {
+    OPENAI_DECISIONS_API_KEY: "sk-openai-fixture",
+    TYPESAFE_API_KEY: "tsk-env-only-secret",
+  });
+  const requests = stubFetch(t, decisionsReply());
+  const h = harness(t);
+  h.store.update({ judge: "decisions" } as never);
+  h.sm.appendMessage(assistant("Use tsk-env-only-secret for the other service. Done and saved."));
+  h.install("0.82.0", false, true);
+  await h.fire("agent_settled");
+  assert.equal(requests.length, 1);
+  assert.ok(!requests[0]?.body.includes("tsk-env-only-secret"));
+});
+
+test("the other judge's key from a cwd .env never reaches the selected judge", async (t) => {
+  withEnv(t, { OPENAI_DECISIONS_API_KEY: "sk-openai-fixture", TYPESAFE_API_KEY: undefined });
+  const requests = stubFetch(t, decisionsReply());
+  const h = harness(t);
+  writeFileSync(`${h.dir}/.env`, "TYPESAFE_API_KEY=tsk-dotenv-only-secret\n");
+  h.store.update({ judge: "decisions" } as never);
+  h.sm.appendMessage(
+    assistant("Use tsk-dotenv-only-secret for the other service. Done and saved."),
+  );
+  h.install("0.82.0", false, true);
+  await h.fire("agent_settled");
+  assert.equal(requests.length, 1);
+  assert.ok(!requests[0]?.body.includes("tsk-dotenv-only-secret"));
 });

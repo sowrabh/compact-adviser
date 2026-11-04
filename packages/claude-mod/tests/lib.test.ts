@@ -10,6 +10,7 @@ import {
   readConfig,
 } from "../lib/config.ts";
 import { parseDotenvKey, resolveTypesafeApiKey } from "../lib/env.ts";
+import { cacheHeld, cacheTtl, idleDelayMs, walkAwayAction } from "../lib/idle.ts";
 import {
   ENDPOINT,
   FLOOR_MAX,
@@ -96,26 +97,36 @@ describe("settings", () => {
   test("configuration combines the host rows with stored acknowledgement and ignores legacy sharingConsent", () => {
     expect(readConfig(rows("hint", 40000), undefined)).toEqual({
       mode: "hint",
+      judge: "decisions",
       minContextTokens: 40000,
       contextBudgetTokens: 0,
       autoAcknowledged: false,
       logRequests: false,
       beforeCompactPrompt: "",
+      idleMinutes: 0,
+      keepWarmHours: 8,
     });
     expect(
       readConfig(rows("auto", 60000), {
-        version: 1,
+        version: 2,
         sharingConsent: false,
         autoAcknowledged: true,
       }),
     ).toEqual({
       mode: "auto",
+      judge: "decisions",
       minContextTokens: 60000,
       contextBudgetTokens: 0,
       autoAcknowledged: true,
       logRequests: false,
       beforeCompactPrompt: "",
+      idleMinutes: 0,
+      keepWarmHours: 8,
     });
+    // An acknowledgement from before walk-away compaction and keep-warm does not cover them.
+    expect(
+      readConfig(rows("auto", 60000), { version: 1, autoAcknowledged: true }).autoAcknowledged,
+    ).toBe(false);
     const prompt = (value: unknown) => [
       ...rows("hint", 40000),
       { key: "compact-adviser.beforeCompactPrompt", value },
@@ -144,7 +155,7 @@ describe("settings", () => {
         .minContextTokens,
     ).toBe(70000);
     expect(() =>
-      parseConsent({ version: 2, sharingConsent: true, autoAcknowledged: true }),
+      parseConsent({ version: 3, sharingConsent: true, autoAcknowledged: true }),
     ).toThrow("consent");
     expect(() => parseConsent({ version: 1, autoAcknowledged: "yes" })).toThrow("consent");
   });
@@ -233,7 +244,7 @@ describe("session cooldowns", () => {
     expect(cooldownReason({ ...hinted, completed: 5 }, 60000, 0)).toBeUndefined();
     const failed = backoff(initialState(false, 0), 1000);
     expect(failed.retryAfter).toBe(11000);
-    expect(cooldownReason(failed, 60000, 10999)).toBe("TypeSafe backoff");
+    expect(cooldownReason(failed, 60000, 10999)).toBe("Judge backoff");
     let many = initialState(false, 0);
     for (let i = 0; i < 10; i++) many = backoff(many, 0);
     expect(many.failures).toBe(6);
@@ -745,5 +756,81 @@ describe("jev client", () => {
       "/home/fixture/.claude/compact-adviser-requests-_secret.jsonl",
     );
     expect(requestLogName("")).toBe("compact-adviser-requests-session.jsonl");
+  });
+});
+
+describe("walking away", () => {
+  const HOUR = 3_600_000;
+  const MINUTE = 60_000;
+
+  test("the cache TTL follows the engine's switches and a subscription, else falls back", () => {
+    expect(cacheTtl({ subscription: false })).toEqual({ ttlMs: HOUR, known: false, caching: true });
+    expect(cacheTtl({ subscription: true })).toEqual({ ttlMs: HOUR, known: true, caching: true });
+    expect(cacheTtl({ enable1h: "1", subscription: false })).toEqual({
+      ttlMs: HOUR,
+      known: true,
+      caching: true,
+    });
+    expect(cacheTtl({ force5m: "1", subscription: true })).toEqual({
+      ttlMs: 5 * MINUTE,
+      known: true,
+      caching: true,
+    });
+    expect(cacheTtl({ disabled: "1", subscription: true }).caching).toBe(false);
+    expect(cacheTtl({ force5m: "0", subscription: false }).known).toBe(false);
+  });
+
+  test("the idle point is ten minutes before a 1 h cache ends, one before a 5 min cache", () => {
+    expect(idleDelayMs(cacheTtl({ subscription: true }), 0)).toBe(50 * MINUTE);
+    expect(idleDelayMs(cacheTtl({ subscription: false }), 0)).toBe(50 * MINUTE);
+    expect(idleDelayMs(cacheTtl({ force5m: "1", subscription: false }), 0)).toBe(4 * MINUTE);
+    expect(idleDelayMs(cacheTtl({ force5m: "1", subscription: false }), 30)).toBe(30 * MINUTE);
+  });
+
+  const base = {
+    auto: true,
+    tokens: 120000,
+    minContextTokens: 40000,
+    score: 0.3,
+    idleFloor: 0.5,
+    completed: 5,
+    caching: true,
+    keepWarmHours: 8,
+    idleSince: 0,
+    now: 50 * MINUTE,
+  };
+
+  test("a finished checkpoint compacts; an unfinished one keeps the cache warm", () => {
+    expect(walkAwayAction({ ...base, score: 0.5 })).toEqual({ action: "compact" });
+    expect(walkAwayAction({ ...base, score: 0.499 })).toEqual({ action: "warm" });
+    expect(walkAwayAction({ ...base, score: undefined })).toEqual({ action: "warm" });
+  });
+
+  test("nothing happens outside confirmed auto or below the minimum", () => {
+    expect(walkAwayAction({ ...base, auto: false, score: 1 }).action).toBe("none");
+    expect(walkAwayAction({ ...base, tokens: 39999, score: 1 }).action).toBe("none");
+    expect(walkAwayAction({ ...base, tokens: undefined }).action).toBe("none");
+  });
+
+  test("keep-warm needs two exchanges, caching, and time left", () => {
+    expect(walkAwayAction({ ...base, completed: 1 }).action).toBe("none");
+    expect(walkAwayAction({ ...base, caching: false }).action).toBe("none");
+    expect(walkAwayAction({ ...base, keepWarmHours: 0 }).action).toBe("none");
+    expect(walkAwayAction({ ...base, now: 8 * HOUR - 1 }).action).toBe("warm");
+    expect(walkAwayAction({ ...base, now: 8 * HOUR }).action).toBe("none");
+    // Only the hours bound warming, whatever the cache TTL: there is no ping-count cap.
+    expect(walkAwayAction({ ...base, now: 7 * HOUR }).action).toBe("warm");
+  });
+
+  test("a ping counts as a hit only when the cache served nearly all of the prompt", () => {
+    const usage = (read: number, write: number, input = 16) => ({
+      cache_read_input_tokens: read,
+      cache_creation_input_tokens: write,
+      input_tokens: input,
+      output_tokens: 4,
+    });
+    expect(cacheHeld(usage(75664, 5))).toBe(true);
+    expect(cacheHeld(usage(35874, 39640))).toBe(false);
+    expect(cacheHeld(usage(0, 0, 0))).toBe(false);
   });
 });

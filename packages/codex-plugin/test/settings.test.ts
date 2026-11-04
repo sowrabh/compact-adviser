@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,7 @@ import {
   parseMode,
   parseSavedApiKey,
 } from "../src/config.ts";
+import { QUESTIONS } from "../src/judge.ts";
 import { adviserRoot, codexHome } from "../src/paths.ts";
 import { initialState } from "../src/state.ts";
 import { SessionStore } from "../src/store.ts";
@@ -171,6 +172,7 @@ test("the CLI saves each setting and reports the mode change", async () => {
 test("the CLI saves and clears a key without ever printing it", async () => {
   await withLab(async (lab) => {
     const store = new ConfigStore(adviserRoot({ CODEX_HOME: lab.home }));
+    store.update({ judge: "jev" } as never);
     const saved = await run(["key", "set"], cli(lab));
     assert.equal(store.read().typesafeApiKey, "tsk-typed-by-hand");
     assert.ok(!saved.includes("tsk-typed-by-hand"));
@@ -184,6 +186,7 @@ test("the CLI saves and clears a key without ever printing it", async () => {
 test("key set never writes the typed secret to the terminal", async () => {
   await withLab((lab) => {
     const secret = "tsk-must-never-echo";
+    new ConfigStore(adviserRoot({ CODEX_HOME: lab.home })).update({ judge: "jev" } as never);
     const result = spawnSync(process.execPath, [CLI, "key", "set"], {
       encoding: "utf8",
       input: `${secret}\n`,
@@ -204,6 +207,7 @@ test("key set never writes the typed secret to the terminal", async () => {
 test("status names the mode, the key source, and the latest session's cooldown", async () => {
   await withLab(async (lab) => {
     const root = adviserRoot({ CODEX_HOME: lab.home });
+    new ConfigStore(root).update({ judge: "jev" } as never);
     new SessionStore(root).write("s1", initialState(false, 1), { tokens: 50000, window: 200000 });
     const text = await run(
       ["status"],
@@ -247,5 +251,58 @@ test("the CLI explains that automatic mode does not exist on Codex", async () =>
     assert.ok(AUTO_UNAVAILABLE.includes("/compact"));
     assert.match(await run([], cli(lab)), /Automatic compaction is not available on Codex/);
     await assert.rejects(run(["nonsense"], cli(lab)), /Usage: compact-adviser/);
+  });
+});
+
+test("the CLI saves the judge, refuses others, and status names it", async () => {
+  await withLab(async (lab) => {
+    const env = cli(lab);
+    assert.match(await run(["judge", "jev"], env), /Judge saved: TypeSafe Jev/);
+    assert.equal(new ConfigStore(adviserRoot({ CODEX_HOME: lab.home })).read().judge, "jev");
+    await assert.rejects(run(["judge", "gemini"], env), /decisions or jev/);
+    assert.match(await run(["status"], env), /Judge: jev\./);
+    assert.match(await run(["judge", "decisions"], env), /Judge saved: OpenAI Decisions/);
+    assert.match(await run(["status"], env), /Judge: decisions\./);
+  });
+});
+
+test("the CLI saves the OpenAI key for the default judge without printing it", async () => {
+  await withLab(async (lab) => {
+    const store = new ConfigStore(adviserRoot({ CODEX_HOME: lab.home }));
+    const saved = await run(
+      ["key", "set"],
+      cli(lab, { readSecret: async () => "sk-typed" } as never),
+    );
+    assert.match(saved, /OpenAI API key saved/);
+    assert.equal((store.read() as { openaiApiKey?: string }).openaiApiKey, "sk-typed");
+    assert.equal(store.read().typesafeApiKey, undefined);
+    assert.ok(!saved.includes("sk-typed"));
+    assert.equal(await run(["key", "status"], cli(lab)), "Key: saved");
+  });
+});
+
+test("a Jev profile with questions, invalid under the Decisions default, is repaired by judge jev", async () => {
+  await withLab(async (lab) => {
+    const store = new ConfigStore(adviserRoot({ CODEX_HOME: lab.home }));
+    mkdirSync(dirname(store.path), { recursive: true });
+    const profile = JSON.stringify({
+      version: 1,
+      coordinationWeight: 0.5,
+      floors: [[0, 0.6]],
+      questions: QUESTIONS,
+    });
+    writeFileSync(
+      store.path,
+      JSON.stringify({ version: 1, mode: "hint", minContextTokens: 40000, profile }),
+    );
+    assert.throws(() => store.read(), /settings/);
+    assert.match(await run(["judge", "jev"], cli(lab)), /Judge saved: TypeSafe Jev/);
+    assert.equal(store.read().judge, "jev");
+    assert.equal(store.read().profile, profile);
+    writeFileSync(
+      store.path,
+      JSON.stringify({ version: 2, mode: "hint", minContextTokens: 40000 }),
+    );
+    await assert.rejects(run(["judge", "jev"], cli(lab)));
   });
 });

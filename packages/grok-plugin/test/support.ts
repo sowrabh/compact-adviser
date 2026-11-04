@@ -27,7 +27,11 @@ export function lab(t: TestContext, sessionId = "01a0b000-0000-7000-8000-0000000
   mkdirSync(cwd, { recursive: true });
   mkdirSync(sessionDir, { recursive: true });
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  return { home, cwd, sessionId, sessionDir, dataDir: join(home, "compact-adviser") };
+  const dataDir = join(home, "compact-adviser");
+  // Upstream's suites run as the Jev judge; the Decisions default has its own tests.
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(join(dataDir, "settings.json"), '{"version":1,"judge":"jev"}\n');
+  return { home, cwd, sessionId, sessionDir, dataDir };
 }
 
 /** One `chat_history.jsonl` record, in the shapes Grok actually writes. */
@@ -103,6 +107,8 @@ export interface Fixture {
   hang: boolean;
   /** Runs after a request body arrives and before it is answered. */
   onRequest?: () => void;
+  /** When true, a Decisions request is answered with a refusal of the second question. */
+  refuse?: boolean;
 }
 
 export function typesafeFixture(t: TestContext): Promise<Fixture> {
@@ -141,6 +147,30 @@ export function typesafeFixture(t: TestContext): Promise<Fixture> {
         return;
       }
       response.writeHead(200, { "content-type": "application/json" });
+      if ((JSON.parse(body || "{}") as { model?: string }).model === "gpt-6-luna") {
+        response.end(
+          JSON.stringify(
+            state.refuse
+              ? {
+                  model: "gpt-6-luna",
+                  answers: [
+                    { type: "predicate", name: "finished", probability: state.verdict.finished },
+                    { type: "refusal", name: "hands_on" },
+                  ],
+                  usage: { input_tokens: 8200, output_tokens: 0 },
+                }
+              : {
+                  model: "gpt-6-luna",
+                  answers: [
+                    { type: "predicate", name: "finished", probability: state.verdict.finished },
+                    { type: "predicate", name: "hands_on", probability: state.verdict.handsOn },
+                  ],
+                  usage: { input_tokens: 8200, output_tokens: 0 },
+                },
+          ),
+        );
+        return;
+      }
       response.end(
         JSON.stringify({
           model: "jev-1.13.0",

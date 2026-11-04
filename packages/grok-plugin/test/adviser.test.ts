@@ -63,6 +63,7 @@ test("a stored profile controls the real hook verdict", async (t) => {
     join(l.dataDir, "settings.json"),
     JSON.stringify({
       version: 1,
+      judge: "jev",
       profile: JSON.stringify({ version: 1, coordinationWeight: 1, floors: [[0, 1]] }),
     }),
   );
@@ -83,7 +84,10 @@ test("a profile that turns invalid while the judge is pending retires the hint a
   writeFileSync(statePath, JSON.stringify({ ...seeded, failures: 3 }));
   writeHistory(l, [...workedHistory("one"), ...workedHistory("two").slice(1)]);
   fixture.onRequest = () =>
-    writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"profile":"not a profile"}');
+    writeFileSync(
+      join(l.dataDir, "settings.json"),
+      '{"version":1,"judge":"jev","profile":"not a profile"}',
+    );
   await runCli(["hook", "stop"], {
     lab: l,
     stdin: stopPayload(l, { promptId: "prompt-2" }),
@@ -289,8 +293,8 @@ test("a refused judgment backs off, reports its kind, and never hints", async (t
   const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
   assert.ok(!row.stdout.includes(HINT));
   const status = await runCli(["status"], { lab: l });
-  assert.match(status.stdout, /Last TypeSafe outcome: authentication/);
-  assert.match(status.stdout, /TypeSafe backoff/);
+  assert.match(status.stdout, /Last judge outcome: authentication/);
+  assert.match(status.stdout, /Judge backoff/);
 });
 
 test("TYPESAFE_BASE sends the judgment to that base's /v1/systemone", async (t) => {
@@ -319,8 +323,8 @@ test("an invalid TYPESAFE_BASE asks nobody, never hints, and reports why", async
   const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
   assert.ok(!row.stdout.includes(HINT));
   const status = await runCli(["status"], { lab: l });
-  assert.match(status.stdout, /Last TypeSafe outcome: configuration/);
-  assert.match(status.stdout, /TypeSafe backoff/);
+  assert.match(status.stdout, /Last judge outcome: configuration/);
+  assert.match(status.stdout, /Judge backoff/);
 });
 
 test("request logging writes the request and the outcome, and never the key", async (t) => {
@@ -449,7 +453,7 @@ test("a TypeSafe timeout aborts the in-flight request and stays silent", async (
   assert.equal(fixture.bodies.length, 1);
   const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
   assert.ok(!row.stdout.includes(HINT));
-  assert.match((await runCli(["status"], { lab: l })).stdout, /Last TypeSafe outcome: timeout/);
+  assert.match((await runCli(["status"], { lab: l })).stdout, /Last judge outcome: timeout/);
 });
 
 test("an oversized TypeSafe response is refused without a hint", async (t) => {
@@ -459,7 +463,7 @@ test("an oversized TypeSafe response is refused without a hint", async (t) => {
   assert.equal(fixture.bodies.length, 1);
   const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
   assert.ok(!row.stdout.includes(HINT));
-  assert.match((await runCli(["status"], { lab: l })).stdout, /Last TypeSafe outcome: response/);
+  assert.match((await runCli(["status"], { lab: l })).stdout, /Last judge outcome: response/);
 });
 
 test("setup, doctor, items, and hint are not commands", async (t) => {
@@ -599,6 +603,7 @@ test("COMPACT_ADVISER_DISABLE hides an already earned hint", async (t) => {
 
 test("install reports a launcher write failure instead of succeeding", async (t) => {
   const l = lab(t);
+  rmSync(l.dataDir, { recursive: true, force: true });
   writeFileSync(l.dataDir, "not a directory");
   const installed = await runCli(["install"], { lab: l });
   assert.notEqual(installed.code, 0);
@@ -607,6 +612,7 @@ test("install reports a launcher write failure instead of succeeding", async (t)
 
 test("session start stays silent when launchers cannot be written", async (t) => {
   const l = lab(t);
+  rmSync(l.dataDir, { recursive: true, force: true });
   writeFileSync(l.dataDir, "not a directory");
   const start = await runCli(["hook", "session-start"], {
     lab: l,
@@ -614,4 +620,124 @@ test("session start stays silent when launchers cannot be written", async (t) =>
   });
   assert.equal(start.code, 0);
   assert.equal(start.stdout, "");
+});
+
+test("Decisions is the default judge: its own key and two predicates", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1}');
+  await runCli(["hook", "stop"], {
+    lab: l,
+    stdin: stopPayload(l),
+    env: {
+      COMPACT_ADVISER_TEST_ENDPOINT: fixture.url,
+      TYPESAFE_API_KEY: "tsk-test-key",
+      OPENAI_DECISIONS_API_KEY: "sk-openai-test-key",
+    },
+  });
+  assert.equal(fixture.bodies.length, 1);
+  const body = JSON.parse(fixture.bodies[0] ?? "{}") as {
+    model: string;
+    questions: { name: string }[];
+  };
+  assert.equal(body.model, "gpt-6-luna");
+  assert.deepEqual(
+    body.questions.map((q) => q.name),
+    ["finished", "hands_on"],
+  );
+  for (const secret of ["sk-openai-test-key", "tsk-test-key"])
+    assert.ok(!(fixture.bodies[0] ?? "").includes(secret));
+  const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
+  assert.ok(row.stdout.includes(HINT));
+});
+
+test("no substitution: Decisions without its key asks nobody, even with a TypeSafe key", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"judge":"decisions"}');
+  await runCli(["hook", "stop"], { lab: l, stdin: stopPayload(l), env: keyed(fixture) });
+  assert.equal(fixture.bodies.length, 0);
+});
+
+test("a Decisions refusal shows no hint", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"judge":"decisions"}');
+  fixture.refuse = true;
+  await runCli(["hook", "stop"], {
+    lab: l,
+    stdin: stopPayload(l),
+    env: {
+      COMPACT_ADVISER_TEST_ENDPOINT: fixture.url,
+      OPENAI_DECISIONS_API_KEY: "sk-openai-test-key",
+    },
+  });
+  assert.equal(fixture.bodies.length, 1);
+  const row = await runCli(["status-line"], { lab: l, stdin: statusPayload(l) });
+  assert.ok(!row.stdout.includes(HINT));
+});
+
+test("the shell CLI saves the judge, refuses others, and status names it", async (t) => {
+  const l = lab(t);
+  assert.match(
+    (await runCli(["judge", "decisions"], { lab: l })).stdout,
+    /Judge saved: OpenAI Decisions/,
+  );
+  const refused = await runCli(["judge", "gemini"], { lab: l });
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /decisions or jev/);
+  assert.match((await runCli(["status"], { lab: l })).stdout, /Judge: decisions\./);
+});
+
+test("the other judge's key in the environment never reaches the selected judge", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"judge":"decisions"}');
+  writeHistory(l, [
+    ...workedHistory("one"),
+    { type: "assistant", content: "Use tsk-env-only-secret elsewhere. It is committed." },
+  ]);
+  await runCli(["hook", "stop"], {
+    lab: l,
+    stdin: stopPayload(l),
+    env: {
+      COMPACT_ADVISER_TEST_ENDPOINT: fixture.url,
+      TYPESAFE_API_KEY: "tsk-env-only-secret",
+      OPENAI_DECISIONS_API_KEY: "sk-openai-test-key",
+    },
+  });
+  assert.equal(fixture.bodies.length, 1);
+  assert.ok(!(fixture.bodies[0] ?? "").includes("tsk-env-only-secret"));
+});
+
+test("a Jev profile with questions, invalid under the Decisions default, is repaired by judge jev", async (t) => {
+  const { QUESTIONS } = await import("../lib/judge.ts");
+  const l = lab(t);
+  const profile = JSON.stringify({
+    version: 1,
+    coordinationWeight: 0.5,
+    floors: [[0, 0.6]],
+    questions: QUESTIONS,
+  });
+  writeFileSync(join(l.dataDir, "settings.json"), JSON.stringify({ version: 1, profile }));
+  assert.equal((await runCli(["status"], { lab: l })).code, 1);
+  const saved = await runCli(["judge", "jev"], { lab: l });
+  assert.equal(saved.code, 0, saved.stderr);
+  assert.match((await runCli(["status"], { lab: l })).stdout, /Judge: jev\./);
+});
+
+test("the other judge's key from a cwd .env never reaches the selected judge", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"judge":"decisions"}');
+  writeFileSync(join(l.cwd, ".env"), "TYPESAFE_API_KEY=tsk-dotenv-only-secret\n");
+  writeHistory(l, [
+    ...workedHistory("one"),
+    { type: "assistant", content: "Use tsk-dotenv-only-secret elsewhere. It is committed." },
+  ]);
+  await runCli(["hook", "stop"], {
+    lab: l,
+    stdin: stopPayload(l),
+    env: {
+      COMPACT_ADVISER_TEST_ENDPOINT: fixture.url,
+      OPENAI_DECISIONS_API_KEY: "sk-openai-test-key",
+    },
+  });
+  assert.equal(fixture.bodies.length, 1);
+  assert.ok(!(fixture.bodies[0] ?? "").includes("tsk-dotenv-only-secret"));
 });

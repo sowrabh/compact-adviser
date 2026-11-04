@@ -920,3 +920,18 @@ test("the other judge's key in the environment never reaches the selected judge"
   assert.equal(requests.length, 1);
   assert.ok(!requests[0]?.body.includes("tsk-env-only-secret"));
 });
+
+test("the other judge's key from a cwd .env never reaches the selected judge", async (t) => {
+  withEnv(t, { OPENAI_DECISIONS_API_KEY: "sk-openai-fixture", TYPESAFE_API_KEY: undefined });
+  const requests = stubFetch(t, decisionsReply());
+  const h = harness(t);
+  writeFileSync(`${h.dir}/.env`, "TYPESAFE_API_KEY=tsk-dotenv-only-secret\n");
+  h.store.update({ judge: "decisions" } as never);
+  h.sm.appendMessage(
+    assistant("Use tsk-dotenv-only-secret for the other service. Done and saved."),
+  );
+  h.install("0.82.0", false, true);
+  await h.fire("agent_settled");
+  assert.equal(requests.length, 1);
+  assert.ok(!requests[0]?.body.includes("tsk-dotenv-only-secret"));
+});

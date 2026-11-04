@@ -156,6 +156,23 @@ describe("the judge switch", () => {
     for (const write of w.journal.fsWrites) expect(write.text.includes(KEY)).toBe(false);
   });
 
+  test("the other judge's key from a cwd .env never reaches the selected judge", async ($, on) => {
+    const dotenvKey = "tsk-dotenv-only-secret-000";
+    const w = world(on, {
+      judge: "decisions",
+      key: undefined,
+      openaiKey: OPENAI_KEY,
+      logRequests: true,
+      dotenv: `TYPESAFE_API_KEY=${dotenvKey}\n`,
+    });
+    w.messages = longConversation(`Use ${dotenvKey} for the other service.`);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(w.journal.requests[0]?.body.includes(dotenvKey)).toBe(false);
+    for (const write of w.journal.fsWrites) expect(write.text.includes(dotenvKey)).toBe(false);
+  });
+
   test("an OpenAI key in the environment never reaches TypeSafe", async ($, on) => {
     const w = world(on, { judge: "jev", openaiKey: OPENAI_KEY, logRequests: true });
     w.messages = longConversation(`Use ${OPENAI_KEY} for the other service.`);
@@ -485,7 +502,8 @@ describe("turn-end gates", () => {
     const w = world(on, { dotenv: "TYPESAFE_API_KEY=from-dotenv\n" });
     await $.session.start(interactiveStart);
     await turnEnd($, w);
-    expect(w.journal.fsReads).toEqual([]);
+    // The .env is read only to scrub the other judge's key, never to pick this one.
+    expect(w.journal.fsReads.every((path) => path.endsWith(".env"))).toBe(true);
     expect(w.journal.requests).toHaveLength(1);
     expect(w.journal.requests[0]?.headers.Authorization).toBe(`Bearer ${KEY}`);
     expect(w.journal.requests[0]?.body.includes("from-dotenv")).toBe(false);
@@ -499,7 +517,8 @@ describe("turn-end gates", () => {
     });
     await $.session.start(interactiveStart);
     await turnEnd($, w);
-    expect(w.journal.fsReads).toEqual([]);
+    // The .env is read only to scrub the other judge's key, never to pick this one.
+    expect(w.journal.fsReads.every((path) => path.endsWith(".env"))).toBe(true);
     expect(w.journal.requests).toHaveLength(1);
     expect(w.journal.requests[0]?.headers.Authorization).toBe("Bearer from-saved");
     expect(w.journal.requests[0]?.body.includes("from-saved")).toBe(false);

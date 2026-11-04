@@ -612,3 +612,25 @@ test("the other judge's key in the environment never reaches the selected judge"
     lab.cleanup();
   }
 });
+
+test("the other judge's key from a cwd .env never reaches the selected judge", async () => {
+  const lab = makeLab();
+  try {
+    writeRollout(lab.transcript, settledRollout());
+    writeFileSync(
+      lab.transcript,
+      readFileSync(lab.transcript, "utf8").replace(
+        "Done: the parser",
+        "Use tsk-dotenv-only-secret elsewhere. Done: the parser",
+      ),
+    );
+    writeFileSync(`${lab.cwd}/.env`, "TYPESAFE_API_KEY=tsk-dotenv-only-secret\n");
+    const judge = fakeTypesafe(() => ({ body: decisionsReply() }));
+    const env = { CODEX_HOME: lab.home, OPENAI_DECISIONS_API_KEY: "sk-openai-fixture" };
+    await handle(stop(lab), environment(lab, { env, fetch: judge.fetch }));
+    assert.equal(judge.requests.length, 1);
+    assert.ok(!JSON.stringify(judge.requests[0]?.body).includes("tsk-dotenv-only-secret"));
+  } finally {
+    lab.cleanup();
+  }
+});

@@ -402,6 +402,7 @@ async function runStop(payload: HookPayload): Promise<void> {
     transcript.messages,
     [
       activeKey,
+      resolveKey(settings, cwd, judgeName === "decisions" ? "jev" : "decisions").value,
       process.env.OPENAI_DECISIONS_API_KEY,
       process.env.TYPESAFE_API_KEY,
       settings.typesafeApiKey,

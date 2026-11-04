@@ -721,3 +721,23 @@ test("a Jev profile with questions, invalid under the Decisions default, is repa
   assert.equal(saved.code, 0, saved.stderr);
   assert.match((await runCli(["status"], { lab: l })).stdout, /Judge: jev\./);
 });
+
+test("the other judge's key from a cwd .env never reaches the selected judge", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"judge":"decisions"}');
+  writeFileSync(join(l.cwd, ".env"), "TYPESAFE_API_KEY=tsk-dotenv-only-secret\n");
+  writeHistory(l, [
+    ...workedHistory("one"),
+    { type: "assistant", content: "Use tsk-dotenv-only-secret elsewhere. It is committed." },
+  ]);
+  await runCli(["hook", "stop"], {
+    lab: l,
+    stdin: stopPayload(l),
+    env: {
+      COMPACT_ADVISER_TEST_ENDPOINT: fixture.url,
+      OPENAI_DECISIONS_API_KEY: "sk-openai-test-key",
+    },
+  });
+  assert.equal(fixture.bodies.length, 1);
+  assert.ok(!(fixture.bodies[0] ?? "").includes("tsk-dotenv-only-secret"));
+});

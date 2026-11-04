@@ -204,8 +204,11 @@ async function onStop(payload: HookPayload, environment: Environment): Promise<H
   if (cooldownReason(state, tokens, now) !== undefined) return {};
 
   // Both judges' keys are scrubbed, so neither provider ever receives the other's.
+  const other = judgeName === "decisions" ? "jev" : "decisions";
   const scrub = [
     key.value,
+    resolveKey(environment.env, config[SAVED_KEY[other].field], payload.cwd ?? process.cwd(), other)
+      .value,
     environment.env.OPENAI_DECISIONS_API_KEY,
     environment.env.TYPESAFE_API_KEY,
     config.typesafeApiKey,

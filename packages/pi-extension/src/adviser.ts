@@ -298,6 +298,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
     // Both judges' keys are scrubbed, so neither provider ever receives the other's.
     const view = snapshot(ctx, [
       key(ctx.cwd, judgeName),
+      key(ctx.cwd, judgeName === "decisions" ? "jev" : "decisions"),
       process.env.OPENAI_DECISIONS_API_KEY,
       process.env.TYPESAFE_API_KEY,
       savedApiKey(store, "decisions"),

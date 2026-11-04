@@ -490,17 +490,21 @@ async function judgeCheckpoint($: EngineInterface, epoch: number): Promise<void>
   try {
     const initial = await loadConfig($);
     const profile = parseProfile(initial.profile, initial.judge);
-    const [messages, activeKey, rows, openaiFromEnv, typesafeFromEnv] = await Promise.all([
-      $.session.messages(),
-      apiKey($, initial.judge),
-      $.config.list(),
-      $.env.get("OPENAI_DECISIONS_API_KEY"),
-      $.env.get("TYPESAFE_API_KEY"),
-    ]);
-    // Both judges' keys are scrubbed, so neither provider ever receives the other's. A cwd
-    // `.env` is not read for the unselected judge; the snapshot redacts `.env` reads already.
+    const [messages, activeKey, otherKey, rows, openaiFromEnv, typesafeFromEnv] = await Promise.all(
+      [
+        $.session.messages(),
+        apiKey($, initial.judge),
+        apiKey($, initial.judge === "decisions" ? "jev" : "decisions"),
+        $.config.list(),
+        $.env.get("OPENAI_DECISIONS_API_KEY"),
+        $.env.get("TYPESAFE_API_KEY"),
+      ],
+    );
+    // Both judges' keys, from every source, are scrubbed, so neither provider ever receives
+    // the other's.
     const view = snapshot(messages, [
       activeKey,
+      otherKey,
       openaiFromEnv,
       typesafeFromEnv,
       readSavedApiKey(rows, loadedOptions, "decisions"),

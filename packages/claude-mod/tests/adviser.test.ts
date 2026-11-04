@@ -6,6 +6,7 @@ import {
   JUDGE_DISABLED_NETWORK_MESSAGE,
   judgeErrorMessage,
   parseJudgment,
+  QUESTIONS,
   score,
 } from "../lib/judge.ts";
 import { RECENT_TAIL_MESSAGES } from "../lib/snapshot.ts";
@@ -14,11 +15,13 @@ import {
   answered,
   autoFocused,
   commandRun,
+  decisionsAnswer,
   elements,
   interactiveStart,
   jevAnswer,
   KEY,
   longConversation,
+  OPENAI_KEY,
   PLUGIN,
   pane,
   rows,
@@ -117,6 +120,120 @@ describe("the COMPACT_ADVISER_DISABLE kill switch", () => {
       expect(w.journal.commands).toEqual([PLUGIN]);
     });
   }
+});
+
+describe("the judge switch", () => {
+  test("Decisions is the default judge: two predicates, the OpenAI key, the same hint", async ($, on) => {
+    const w = world(on, { judge: "absent", openaiKey: OPENAI_KEY, logRequests: true });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    const request = w.journal.requests[0] ?? { url: "", headers: {}, body: "" };
+    expect(request.url).toBe("https://api.openai.com/v1/decisions");
+    expect(request.headers.Authorization).toBe(`Bearer ${OPENAI_KEY}`);
+    const body = JSON.parse(request.body);
+    expect(body.model).toBe("gpt-6-luna");
+    expect(
+      body.questions.map((q: { type: string; name: string }) => `${q.type}:${q.name}`),
+    ).toEqual(["predicate:finished", "predicate:hands_on"]);
+    for (const secret of [OPENAI_KEY, KEY]) {
+      expect(request.body.includes(secret)).toBe(false);
+      for (const write of w.journal.fsWrites) expect(write.text.includes(secret)).toBe(false);
+    }
+    expect(w.journal.statuses.at(-1)).toBe(HINT);
+    const response = lastJsonl(w.journal.fsWrites[1]);
+    expect(response.judge).toBe("decisions");
+    expect(response.answers).toEqual({ finished: 0.99, hands_on: 0.99 });
+  });
+
+  test("judge jev asks TypeSafe with the TypeSafe key even when an OpenAI key is set", async ($, on) => {
+    const w = world(on, { judge: "jev", openaiKey: OPENAI_KEY });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests.map((r) => r.url)).toEqual(["https://api.typesafe.ai/v1/systemone"]);
+    expect(w.journal.requests[0]?.headers.Authorization).toBe(`Bearer ${KEY}`);
+  });
+
+  test("no substitution: Decisions without its key asks nobody, even with a TypeSafe key", async ($, on) => {
+    const w = world(on, { judge: "decisions" });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(0);
+    expect(hinted(w)).toBe(false);
+  });
+
+  test("a Decisions refusal or failure leaves context alone and names OpenAI", async ($, on) => {
+    const w = world(on, {
+      judge: "decisions",
+      openaiKey: OPENAI_KEY,
+      mode: "auto",
+      consent: { autoAcknowledged: true },
+    });
+    const refused = decisionsAnswer();
+    refused.answers[1] = { type: "refusal", name: "hands_on" } as never;
+    w.respond = async () => ({ status: 200, text: JSON.stringify(refused) });
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(hinted(w)).toBe(false);
+    expect(w.journal.compactions).toHaveLength(0);
+    expect(w.journal.toasts.at(-1)).toContain("OpenAI (Decisions)");
+    expect(w.journal.toasts.at(-1)).toContain("declined to answer");
+    expect(Number(stored(w).retryAfter)).toBeGreaterThan(START);
+  });
+
+  test("a saved OpenAI key is used when the environment has none and stays hidden in /config", async ($, on) => {
+    const w = world(on, { judge: "decisions", savedOpenaiKey: OPENAI_KEY });
+    on("config.describe", async (_$, e) => ({ ...(e as object), isHidden: false }) as never);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests[0]?.headers.Authorization).toBe(`Bearer ${OPENAI_KEY}`);
+    const described = await $.config.describe({
+      key: `${PLUGIN}.openaiApiKey`,
+      label: "OpenAI API key",
+      isHidden: false,
+      provider: { plugin: PLUGIN, tier: "user" },
+    } as never);
+    expect((described as { isHidden?: boolean }).isHidden).toBe(true);
+  });
+
+  test("a profile with Jev questions disables advice while Decisions is selected", async ($, on) => {
+    const w = world(on, { judge: "decisions", openaiKey: OPENAI_KEY });
+    w.rows.set(
+      `${PLUGIN}.profile`,
+      JSON.stringify({
+        version: 1,
+        coordinationWeight: 0.5,
+        floors: [[0, 0.5]],
+        questions: QUESTIONS,
+      }),
+    );
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(0);
+    expect(w.journal.toasts.join(" ")).toContain("jev judge only");
+  });
+
+  test("the judge command saves a judge and refuses anything else", async ($, on) => {
+    const w = world(on, { judge: "decisions", openaiKey: OPENAI_KEY });
+    await $.session.start(interactiveStart);
+    await $.command.run(commandRun("judge jev"));
+    expect(w.rows.get(`${PLUGIN}.judge`)).toBe("jev");
+    await $.command.run(commandRun("judge gemini"));
+    expect(w.rows.get(`${PLUGIN}.judge`)).toBe("jev");
+    expect(w.journal.toasts.at(-1)).toContain("decisions or jev");
+  });
+
+  test("status names the judge and its key source, never a key", async ($, on) => {
+    const w = world(on, { judge: "decisions", openaiKey: OPENAI_KEY });
+    await $.session.start(interactiveStart);
+    await $.command.run(commandRun("status"));
+    const status = w.journal.logs.at(-1) ?? "";
+    expect(status).toContain("Judge: decisions");
+    expect(status).toContain("Key: env");
+    expect(status.includes(OPENAI_KEY)).toBe(false);
+    expect(status.includes(KEY)).toBe(false);
+  });
 });
 
 describe("turn-end gates", () => {
@@ -1295,11 +1412,11 @@ describe("commands", () => {
     await $.session.start(interactiveStart);
     await $.command.run(commandRun("sharing on"));
     expect(w.journal.toasts.at(-1)).toBe(
-      "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
+      "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
     );
     await $.command.run(commandRun("sharing off"));
     expect(w.journal.toasts.at(-1)).toBe(
-      "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
+      "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
     );
     expect(w.journal.asks).toHaveLength(0);
   });
@@ -1310,7 +1427,7 @@ describe("commands", () => {
     await $.command.run(commandRun("status"));
     const line = w.journal.logs.at(-1) ?? "";
     expect(line).toBe(
-      "Mode: hint. Minimum: 40,000 tokens. Budget: off. Context: 60,000 (36% of the context limit; hint floor 0.77). Key: env. No cooldown; semantic checks still apply. Claude Code auto-compacts at 167,000 tokens. Request log: off. Settings: /config (compact-adviser rows) and /compact-adviser.",
+      "Mode: hint. Judge: jev. Minimum: 40,000 tokens. Budget: off. Context: 60,000 (36% of the context limit; hint floor 0.77). Key: env. No cooldown; semantic checks still apply. Claude Code auto-compacts at 167,000 tokens. Request log: off. Settings: /config (compact-adviser rows) and /compact-adviser.",
     );
     expect(line.includes(KEY)).toBe(false);
   });
@@ -1368,7 +1485,7 @@ describe("commands", () => {
     await $.session.start(interactiveStart);
     await $.command.run(commandRun("threshold"));
     expect(w.journal.toasts.at(-1)).toBe(
-      "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
+      "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.",
     );
   });
 });
@@ -1385,6 +1502,7 @@ describe("settings pane", () => {
       "Minimum context 40,000 tokens",
       "Log TypeSafe requests Off",
       "TypeSafe API key from the environment",
+      "Judge TypeSafe Jev",
       "Reset minimum to 40,000",
       "Status",
       "Close",
@@ -1442,7 +1560,7 @@ describe("settings pane", () => {
     await $.ui.press({ plugin: PLUGIN, key: "menu:mode" });
     await $.ui.render(pane);
     await $.ui.press({ plugin: PLUGIN, key: "back" });
-    expect(rows(await $.ui.render(pane))).toHaveLength(7);
+    expect(rows(await $.ui.render(pane))).toHaveLength(8);
 
     await $.ui.press({ plugin: PLUGIN, key: "menu:minimum" });
     tree = await $.ui.render(pane);
@@ -1457,7 +1575,7 @@ describe("settings pane", () => {
     await $.ui.press({ plugin: PLUGIN, key: "back" });
     await drain(w);
     tree = await $.ui.render(pane);
-    expect(rows(tree)).toHaveLength(7);
+    expect(rows(tree)).toHaveLength(8);
     expect(autoFocused(tree)).toBe("menu:minimum");
     expect(w.journal.closed).toEqual([]);
   });
@@ -1502,7 +1620,7 @@ describe("settings pane", () => {
     await $.ui.press({ plugin: PLUGIN, key: "menu:status" });
     await drain(w);
     expect(text(await $.ui.render(pane))).toContain(
-      "Mode: off. Minimum: 40,000 tokens. Budget: off. Context: 60,000 (36% of the context limit; hint floor 0.77). Key: env.",
+      "Mode: off. Judge: jev. Minimum: 40,000 tokens. Budget: off. Context: 60,000 (36% of the context limit; hint floor 0.77). Key: env.",
     );
     expect(text(await $.ui.render(pane))).not.toContain("Sharing:");
     await $.ui.press({ plugin: PLUGIN, key: "menu:close" });

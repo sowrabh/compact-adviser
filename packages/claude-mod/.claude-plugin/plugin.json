@@ -2,7 +2,7 @@
   "name": "compact-adviser",
   "version": "0.1.14",
   "license": "MIT",
-  "description": "Suggests (or, opt-in, runs) /compact at a completed checkpoint, judged by TypeSafe Jev. Its hooks module activates only when CLAUDE_CODE_ENABLE_FUNCTION_HOOKS is exactly 1 and is otherwise a complete no-op.",
+  "description": "Suggests (or, opt-in, runs) /compact at a completed checkpoint, judged by OpenAI's Decisions API or TypeSafe Jev. Its hooks module activates only when CLAUDE_CODE_ENABLE_FUNCTION_HOOKS is exactly 1 and is otherwise a complete no-op.",
   "author": {
     "name": "Kun Chen"
   },
@@ -27,6 +27,16 @@
       ],
       "default": "hint"
     },
+    "judge": {
+      "type": "string",
+      "title": "Judge",
+      "description": "Which model answers the two checkpoint questions: decisions (OpenAI's Decisions API, gpt-6-luna; key OPENAI_DECISIONS_API_KEY) or jev (TypeSafe; key TYPESAFE_API_KEY). Each judge has its own key and floor schedule.",
+      "options": [
+        "decisions",
+        "jev"
+      ],
+      "default": "decisions"
+    },
     "minContextTokens": {
       "type": "number",
       "title": "Minimum context (tokens)",
@@ -43,8 +53,8 @@
     },
     "logRequests": {
       "type": "boolean",
-      "title": "Log TypeSafe requests",
-      "description": "When on, each TypeSafe/Jev request and sanitized Jev outcome is appended to ~/.claude/compact-adviser-requests-<session-id>.jsonl. Off by default. Never logs the API key.",
+      "title": "Log judge requests",
+      "description": "When on, each judge request and sanitized outcome is appended to ~/.claude/compact-adviser-requests-<session-id>.jsonl. Off by default. Never logs an API key.",
       "default": false
     },
     "profile": {
@@ -63,6 +73,12 @@
       "type": "string",
       "title": "TypeSafe API key",
       "description": "Saved from /compact-adviser. Hidden in /config so the value is never shown. A non-empty TYPESAFE_API_KEY in the launch environment wins. Do not commit this value.",
+      "default": ""
+    },
+    "openaiApiKey": {
+      "type": "string",
+      "title": "OpenAI API key",
+      "description": "Saved from /compact-adviser for the decisions judge. Hidden in /config so the value is never shown. A non-empty OPENAI_DECISIONS_API_KEY in the launch environment wins. Do not commit this value.",
       "default": ""
     }
   }

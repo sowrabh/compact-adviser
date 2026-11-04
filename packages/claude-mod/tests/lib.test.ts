@@ -96,6 +96,7 @@ describe("settings", () => {
   test("configuration combines the host rows with stored acknowledgement and ignores legacy sharingConsent", () => {
     expect(readConfig(rows("hint", 40000), undefined)).toEqual({
       mode: "hint",
+      judge: "decisions",
       minContextTokens: 40000,
       contextBudgetTokens: 0,
       autoAcknowledged: false,
@@ -110,6 +111,7 @@ describe("settings", () => {
       }),
     ).toEqual({
       mode: "auto",
+      judge: "decisions",
       minContextTokens: 60000,
       contextBudgetTokens: 0,
       autoAcknowledged: true,

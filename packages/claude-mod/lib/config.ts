@@ -1,32 +1,50 @@
 // Persistent preferences, with the same semantics as the Pi extension's configuration.
 //
-// `mode`, `minContextTokens`, `contextBudgetTokens`, `logRequests`, `profile`, and
+// `mode`, `judge`, `minContextTokens`, `contextBudgetTokens`, `logRequests`, `profile`, and
 // `beforeCompactPrompt` are the plugin's manifest `userConfig` rows: the host
 // validates them, stores them in the user's settings.json, and shows them in /config.
-// `typesafeApiKey` is also a userConfig row so it lives in that same settings path, but this
-// module hides it from `/config` so the secret is never drawn there. Set, clear, and presence
-// are the compact-adviser pane's job.
+// `openaiApiKey` and `typesafeApiKey` are also userConfig rows so they live in that same
+// settings path, but this module hides them from `/config` so a secret is never drawn there.
+// Set, clear, and presence are the compact-adviser pane's job.
 // `autoAcknowledged` lives in the plugin's own store so that only this mod's confirmation
 // dialog can grant experimental automatic mode. A legacy `sharingConsent` field is ignored.
 
+import { DEFAULT_JUDGE, JUDGES, type JudgeName } from "./judge.ts";
 import { parseProfile } from "./profile.ts";
 
 export type Mode = "hint" | "auto" | "off";
 export const MODES: readonly Mode[] = ["hint", "auto", "off"];
 export const PLUGIN = "compact-adviser";
 export const MODE_KEY = `${PLUGIN}.mode`;
+export const JUDGE_KEY = `${PLUGIN}.judge`;
 export const MINIMUM_KEY = `${PLUGIN}.minContextTokens`;
 export const BUDGET_KEY = `${PLUGIN}.contextBudgetTokens`;
 export const LOG_KEY = `${PLUGIN}.logRequests`;
 export const PROFILE_KEY = `${PLUGIN}.profile`;
 export const BEFORE_COMPACT_PROMPT_KEY = `${PLUGIN}.beforeCompactPrompt`;
 export const API_KEY_KEY = `${PLUGIN}.typesafeApiKey`;
+export const OPENAI_API_KEY_KEY = `${PLUGIN}.openaiApiKey`;
+
+/** Each judge's saved-key row and the option name the module loaded it under. */
+export const SAVED_KEY: Readonly<
+  Record<JudgeName, { row: string; option: string; label: string; article: string }>
+> = {
+  decisions: {
+    row: OPENAI_API_KEY_KEY,
+    option: "openaiApiKey",
+    label: "OpenAI API key",
+    article: "an",
+  },
+  jev: { row: API_KEY_KEY, option: "typesafeApiKey", label: "TypeSafe API key", article: "a" },
+};
 export const CONSENT_STORE_KEY = "preferences";
 export const DEFAULT_MINIMUM = 40000;
 export const MAX_SAVED_API_KEY_LENGTH = 1024;
 
 export interface Config {
   mode: Mode;
+  /** Which model answers the two questions. */
+  judge: JudgeName;
   minContextTokens: number;
   /** Tokens at which the hint floor is fully relaxed; 0 uses Claude Code's own limit. */
   contextBudgetTokens: number;
@@ -67,11 +85,12 @@ export function parseBudget(text: string): number {
   return number;
 }
 
-export function parseSavedApiKey(text: string): string {
+export function parseSavedApiKey(text: string, judge: JudgeName = "jev"): string {
   const value = text.trim();
-  if (!value) throw new Error("Enter a TypeSafe API key, or cancel to leave it unchanged.");
+  const { label, article } = SAVED_KEY[judge];
+  if (!value) throw new Error(`Enter ${article} ${label}, or cancel to leave it unchanged.`);
   if (value.length > MAX_SAVED_API_KEY_LENGTH) {
-    throw new Error("That value is too long to save as a TypeSafe API key.");
+    throw new Error(`That value is too long to save as ${article} ${label}.`);
   }
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
@@ -87,6 +106,13 @@ export class SettingsError extends Error {
     super(message);
     this.name = "SettingsError";
   }
+}
+
+/** A judge name, or the reason it is not one. */
+export function parseJudge(text: string): JudgeName {
+  const value = text.trim();
+  if (!JUDGES.includes(value as JudgeName)) throw new Error("Choose a judge: decisions or jev.");
+  return value as JudgeName;
 }
 
 /** Reads the stored acknowledgement record; absent means the defaults, anything malformed throws. */
@@ -129,12 +155,16 @@ export function readConfig(
   const row = (key: string, field: string) =>
     rows.find((candidate) => candidate.key === key)?.value ?? loaded[field];
   const mode = row(MODE_KEY, "mode");
+  const judge = row(JUDGE_KEY, "judge") ?? DEFAULT_JUDGE;
   const minimum = row(MINIMUM_KEY, "minContextTokens");
   const budget = row(BUDGET_KEY, "contextBudgetTokens") ?? 0;
   const logRequests = row(LOG_KEY, "logRequests");
   const beforeCompactPrompt = row(BEFORE_COMPACT_PROMPT_KEY, "beforeCompactPrompt") ?? "";
   if (typeof mode !== "string" || !MODES.includes(mode as Mode)) {
     throw new SettingsError("Cannot read the compact-adviser mode setting; no action is taken.");
+  }
+  if (typeof judge !== "string" || !JUDGES.includes(judge as JudgeName)) {
+    throw new SettingsError("Cannot read the compact-adviser judge setting; no action is taken.");
   }
   if (typeof minimum !== "number" || !Number.isSafeInteger(minimum) || minimum <= 0) {
     throw new SettingsError(
@@ -157,10 +187,11 @@ export function readConfig(
     );
   }
   const profile = row(PROFILE_KEY, "profile");
-  parseProfile(profile);
+  parseProfile(profile, judge as JudgeName);
   const consent = parseConsent(consentValue);
   return {
     mode: mode as Mode,
+    judge: judge as JudgeName,
     minContextTokens: minimum,
     contextBudgetTokens: budget,
     autoAcknowledged: consent.autoAcknowledged,
@@ -170,13 +201,14 @@ export function readConfig(
   };
 }
 
-/** Menu-saved TypeSafe key from live `/config` rows or the options this module loaded with. */
+/** A judge's menu-saved key from live `/config` rows or the options this module loaded with. */
 export function readSavedApiKey(
   rows: readonly ConfigRowLike[],
   loaded: Readonly<Record<string, unknown>> = {},
+  judge: JudgeName = "jev",
 ): string | undefined {
-  const value =
-    rows.find((candidate) => candidate.key === API_KEY_KEY)?.value ?? loaded.typesafeApiKey;
+  const { row, option } = SAVED_KEY[judge];
+  const value = rows.find((candidate) => candidate.key === row)?.value ?? loaded[option];
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 

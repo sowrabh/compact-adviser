@@ -22,13 +22,13 @@
 //   starts with `/` is run with `$.command.run` instead. Example value: `/stow`.
 import type { EngineInterface, PluginOptions, Register, RenderChildren } from "claude-code";
 import {
-  API_KEY_KEY,
   BUDGET_KEY,
   CONSENT_STORE_KEY,
   type Config,
   type Consent,
   DEFAULT_MINIMUM,
   formatTokens,
+  JUDGE_KEY,
   LOG_KEY,
   MINIMUM_KEY,
   MODE_KEY,
@@ -36,29 +36,32 @@ import {
   PLUGIN,
   parseBudget,
   parseConsent,
+  parseJudge,
   parseMinimum,
   parseSavedApiKey,
   readConfig,
   readSavedApiKey,
+  SAVED_KEY,
 } from "../lib/config.ts";
 import { disabledByEnv } from "../lib/disable.ts";
+import { formatKeyStatus, type KeySource, parseDotenvKey, resolveApiKey } from "../lib/env.ts";
 import {
-  formatKeyStatus,
-  parseDotenvKey,
-  resolveTypesafeApiKey,
-  type TypesafeKeySource,
-} from "../lib/env.ts";
-import {
+  API_KEY_ENV,
   contextPressure,
+  DECISIONS_ENDPOINT,
+  decide,
+  decisionsRequestBody,
   effectiveBudget,
   floorFor,
-  JUDGE_DISABLED_NETWORK_MESSAGE,
-  JUDGE_UNAVAILABLE_MESSAGE,
   JudgeError,
+  type JudgeName,
   judge,
+  judgeDisabledNetworkMessage,
+  judgeUnavailableMessage,
   qualifies,
   requestBody,
   typesafeEndpoint,
+  type Verdict,
 } from "../lib/judge.ts";
 import {
   errorLogLine,
@@ -93,7 +96,7 @@ const SLASH_COMMAND = /^\/([A-Za-z0-9_:-]{1,64})(?:\s+([\s\S]*))?$/;
 const PENDING_NOTICE_KEY = "pendingNotice";
 const LOOPBACK_ENDPOINT = /^http:\/\/127\.0\.0\.1:\d{1,5}\/[\x21-\x7e]*$/;
 const USAGE =
-  "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.";
+  "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.";
 
 // Per module environment (a hot reload starts fresh; see the header).
 let activation: Promise<boolean> | undefined;
@@ -127,7 +130,7 @@ let diagnostic = "";
 // The settings pane: one list of rows, as the Pi extension's menu, each opening a view
 // of its own; Enter on an option or a saved value returns to the list. A save hot-reloads
 // the module, so this scratch resets to the list on its own.
-type PaneView = "menu" | "mode" | "minimum" | "logging" | "key";
+type PaneView = "menu" | "mode" | "judge" | "minimum" | "logging" | "key";
 let view: PaneView = "menu";
 // The list row the person last opened; the ring returns there.
 let menuRow = "menu:mode";
@@ -142,7 +145,7 @@ let statusDetails: string | undefined;
  * Both environment gates, resolved once per module environment and cached: function
  * hooks must be on, and `COMPACT_ADVISER_DISABLE` must not be set to a truthy value.
  * Every hook goes through here, so a disabled session registers no command, shows no
- * status, and never reaches TypeSafe.
+ * status, and never reaches a judge.
  */
 function isActivated($: EngineInterface): Promise<boolean> {
   if (activation === undefined) {
@@ -158,35 +161,46 @@ function isActivated($: EngineInterface): Promise<boolean> {
   return activation;
 }
 
-async function resolvedKey($: EngineInterface) {
-  const fromEnv = await $.env.get("TYPESAFE_API_KEY");
+/** The selected judge's key: launch environment, then the saved row, then the cwd `.env`. */
+async function resolvedKey($: EngineInterface, judge: JudgeName) {
+  // `$.env.get` takes a literal name, so each judge's variable is spelled out here.
+  const fromEnv =
+    judge === "decisions"
+      ? await $.env.get("OPENAI_DECISIONS_API_KEY")
+      : await $.env.get("TYPESAFE_API_KEY");
   if (fromEnv !== undefined && fromEnv.trim() !== "") {
-    return resolveTypesafeApiKey(fromEnv);
+    return resolveApiKey(fromEnv);
   }
-  const saved = readSavedApiKey(await $.config.list(), loadedOptions);
-  if (saved) return resolveTypesafeApiKey(undefined, saved);
+  const saved = readSavedApiKey(await $.config.list(), loadedOptions, judge);
+  if (saved) return resolveApiKey(undefined, saved);
   let dotenv: string | undefined;
   try {
-    dotenv = parseDotenvKey(await $.fs.read(".env"), "TYPESAFE_API_KEY");
+    dotenv = parseDotenvKey(await $.fs.read(".env"), API_KEY_ENV[judge]);
   } catch {
     dotenv = undefined;
   }
-  return resolveTypesafeApiKey(undefined, undefined, dotenv);
+  return resolveApiKey(undefined, undefined, dotenv);
 }
 
-async function apiKey($: EngineInterface): Promise<string> {
-  return (await resolvedKey($)).value?.trim() ?? "";
+async function apiKey($: EngineInterface, judge: JudgeName): Promise<string> {
+  return (await resolvedKey($, judge)).value?.trim() ?? "";
 }
 
-/** A loopback-only endpoint override for the live regression's local TypeSafe fixture. */
+/** A loopback-only endpoint override for the live regression's local judge fixture. */
 async function testEndpoint($: EngineInterface): Promise<string | undefined> {
   const value = await $.env.get("COMPACT_ADVISER_TEST_ENDPOINT");
   return value !== undefined && LOOPBACK_ENDPOINT.test(value) ? value : undefined;
 }
 
-/** The live regression's fixture, else TypeSafe under `TYPESAFE_BASE` from the launch environment. */
-async function judgeEndpoint($: EngineInterface): Promise<string> {
-  const endpoint = (await testEndpoint($)) ?? typesafeEndpoint(await $.env.get("TYPESAFE_BASE"));
+/**
+ * The live regression's fixture, else the selected judge's endpoint: OpenAI's Decisions API, or
+ * TypeSafe under `TYPESAFE_BASE` from the launch environment.
+ */
+async function judgeEndpoint($: EngineInterface, judge: JudgeName): Promise<string> {
+  const fixture = await testEndpoint($);
+  if (fixture !== undefined) return fixture;
+  if (judge === "decisions") return DECISIONS_ENDPOINT;
+  const endpoint = typesafeEndpoint(await $.env.get("TYPESAFE_BASE"));
   if (endpoint === undefined) throw new JudgeError("configuration");
   return endpoint;
 }
@@ -209,13 +223,13 @@ async function checkpointKey(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function judgeFailureMessage(error: unknown): string {
+function judgeFailureMessage(error: unknown, judge: JudgeName): string {
   // Claude Code refuses plugin network access outright under
   // CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC; say so instead of a generic network error.
   if (String((error as { cause?: unknown })?.cause).includes("nonessential network traffic")) {
-    return JUDGE_DISABLED_NETWORK_MESSAGE;
+    return judgeDisabledNetworkMessage(judge);
   }
-  return error instanceof JudgeError ? error.message : JUDGE_UNAVAILABLE_MESSAGE;
+  return error instanceof JudgeError ? error.message : judgeUnavailableMessage(judge);
 }
 
 async function logHome($: EngineInterface): Promise<string> {
@@ -226,7 +240,7 @@ async function sessionLogPath($: EngineInterface): Promise<string> {
   return requestLogPath(await logHome($), await $.session.id());
 }
 
-async function appendTypeSafeLog($: EngineInterface, line: string): Promise<void> {
+async function appendRequestLog($: EngineInterface, line: string): Promise<void> {
   const path = await sessionLogPath($);
   let existing = "";
   try {
@@ -289,7 +303,7 @@ async function eligible(
     interactive &&
     !compacting &&
     config.mode !== "off" &&
-    (await apiKey($)) !== "" &&
+    (await apiKey($, config.judge)) !== "" &&
     typeof tokens === "number" &&
     Number.isFinite(tokens) &&
     tokens >= config.minContextTokens &&
@@ -433,50 +447,59 @@ async function judgeCheckpoint($: EngineInterface, epoch: number): Promise<void>
   judging = true;
   try {
     const initial = await loadConfig($);
-    const profile = parseProfile(initial.profile);
+    const profile = parseProfile(initial.profile, initial.judge);
     const [messages, activeKey, rows] = await Promise.all([
       $.session.messages(),
-      apiKey($),
+      apiKey($, initial.judge),
       $.config.list(),
     ]);
-    const view = snapshot(messages, [activeKey, readSavedApiKey(rows, loadedOptions)]);
+    const view = snapshot(messages, [
+      activeKey,
+      readSavedApiKey(rows, loadedOptions, "decisions"),
+      readSavedApiKey(rows, loadedOptions, "jev"),
+    ]);
+    const body = () =>
+      initial.judge === "decisions"
+        ? decisionsRequestBody(view.state)
+        : requestBody(view.state, profile);
     if (view.conversationTokens <= 20000) return;
     const fingerprint = await checkpointKey(view.checkpointText);
     if ((await loadState($)).state.lastHintKey === fingerprint) return;
     let loggedBody: string | undefined;
     if (initial.logRequests) {
       try {
-        loggedBody = requestBody(view.state, profile);
-        await appendTypeSafeLog($, requestLogLine(loggedBody));
+        loggedBody = body();
+        await appendRequestLog($, requestLogLine(loggedBody));
       } catch {
         // Request logging must not replace or delay the judgment.
       }
     }
-    let result: Awaited<ReturnType<typeof judge>>;
+    let result: Verdict;
     try {
-      const endpoint = await judgeEndpoint($);
-      result = await judge(
-        view.state,
-        await apiKey($),
-        {
-          fetch: (url, init) => $.http.fetch(url, init),
-          sleep: (ms) => $.clock.sleep(ms),
-          endpoint,
-        },
-        profile,
-      );
+      const transport = {
+        fetch: (
+          url: string,
+          init: { method: string; headers: Record<string, string>; body: string },
+        ) => $.http.fetch(url, init),
+        sleep: (ms: number) => $.clock.sleep(ms),
+        endpoint: await judgeEndpoint($, initial.judge),
+      };
+      result =
+        initial.judge === "decisions"
+          ? await decide(view.state, activeKey, transport)
+          : await judge(view.state, activeKey, transport, profile);
     } catch (error) {
       if (epoch !== generation) return;
       if (initial.logRequests) {
         try {
-          await appendTypeSafeLog($, errorLogLine(loggedJudgeErrorKind(error), loggedBody));
+          await appendRequestLog($, errorLogLine(loggedJudgeErrorKind(error), loggedBody));
         } catch {
           // Error logging must not replace backoff.
         }
       }
       const { key, state } = await loadState($);
       await $.store.set(key, backoff(state, await $.clock.now()));
-      notice($, judgeFailureMessage(error));
+      notice($, judgeFailureMessage(error, initial.judge));
       return;
     }
     if (epoch !== generation) return;
@@ -486,10 +509,10 @@ async function judgeCheckpoint($: EngineInterface, epoch: number): Promise<void>
     const { context } = await $.session.usage({ breakdown: "summary" });
     if (initial.logRequests) {
       try {
-        await appendTypeSafeLog(
+        await appendRequestLog(
           $,
           responseLogLine(
-            loggedBody ?? requestBody(view.state, profile),
+            loggedBody ?? body(),
             result,
             usageFraction(context, latest.contextBudgetTokens),
             undefined,
@@ -579,8 +602,9 @@ async function saveRow(
     $.ui.toast(`Not saved: ${result.deny}`, { timeoutMs: 8000 });
     return false;
   }
-  if (key === API_KEY_KEY && typeof value === "string") {
-    loadedOptions = { ...loadedOptions, typesafeApiKey: value };
+  const savedKey = Object.values(SAVED_KEY).find((entry) => entry.row === key);
+  if (savedKey && typeof value === "string") {
+    loadedOptions = { ...loadedOptions, [savedKey.option]: value };
   }
   diagnostic = "";
   await showPendingNotice($);
@@ -626,8 +650,8 @@ async function saveConsent($: EngineInterface, patch: Partial<Omit<Consent, "ver
   diagnostic = "";
 }
 
-function openPane($: EngineInterface): Promise<void> {
-  return $.ui.open({
+async function openPane($: EngineInterface): Promise<void> {
+  await $.ui.open({
     id: PANE_ID,
     title: "Compact adviser (saved for all sessions)",
     focus: true,
@@ -675,8 +699,13 @@ const MODE_LABELS: Record<Mode, string> = {
   off: "Off",
 };
 
+const JUDGE_LABELS: Record<JudgeName, string> = {
+  decisions: "OpenAI Decisions (default)",
+  jev: "TypeSafe Jev",
+};
+
 /** What the list row says about the key in effect: its source, never its value. */
-const KEY_SOURCE_LABELS: Record<TypesafeKeySource, string> = {
+const KEY_SOURCE_LABELS: Record<KeySource, string> = {
   env: "from the environment",
   saved: "saved",
   ".env": "from .env",
@@ -684,18 +713,19 @@ const KEY_SOURCE_LABELS: Record<TypesafeKeySource, string> = {
 };
 
 /** The key view's explanation: which key is in effect, and what the actions here change. */
-function keyDetail(source: TypesafeKeySource, saved: boolean): string {
+function keyDetail(source: KeySource, saved: boolean, judge: JudgeName): string {
+  const name = API_KEY_ENV[judge];
   switch (source) {
     case "env":
       return saved
-        ? "In effect: TYPESAFE_API_KEY from the launch environment, which wins over the key saved here."
-        : "In effect: TYPESAFE_API_KEY from the launch environment.";
+        ? `In effect: ${name} from the launch environment, which wins over the key saved here.`
+        : `In effect: ${name} from the launch environment.`;
     case "saved":
       return "In effect: the key saved here, for all sessions.";
     case ".env":
-      return "In effect: TYPESAFE_API_KEY from the .env file in the working directory.";
+      return `In effect: ${name} from the .env file in the working directory.`;
     default:
-      return "No key in effect. Save one here, or set TYPESAFE_API_KEY in the environment or a .env file.";
+      return `No key in effect. Save one here, or set ${name} in the environment or a .env file.`;
   }
 }
 
@@ -736,7 +766,7 @@ async function changeMode($: EngineInterface, mode: Mode, fromPane = false): Pro
       $,
       MODE_KEY,
       "auto",
-      "Automatic mode saved (all sessions). A TypeSafe key is still required.",
+      `Automatic mode saved (all sessions). ${(await loadConfig($)).judge === "decisions" ? "An OpenAI" : "A TypeSafe"} key is still required.`,
     );
     return;
   }
@@ -745,6 +775,18 @@ async function changeMode($: EngineInterface, mode: Mode, fromPane = false): Pro
     MODE_KEY,
     mode,
     `${mode === "hint" ? "Hints only" : "Off"} saved (all sessions). Claude Code's built-in compaction is unchanged.`,
+  );
+}
+
+async function changeJudge($: EngineInterface, text: string): Promise<boolean> {
+  const judge = parseJudge(text);
+  return saveRow(
+    $,
+    JUDGE_KEY,
+    judge,
+    judge === "decisions"
+      ? "Judge saved: OpenAI Decisions (all sessions). It reads OPENAI_DECISIONS_API_KEY or a saved OpenAI key."
+      : "Judge saved: TypeSafe Jev (all sessions). It reads TYPESAFE_API_KEY or a saved TypeSafe key.",
   );
 }
 
@@ -778,31 +820,38 @@ async function changeMinimum($: EngineInterface, text: string): Promise<boolean>
 }
 
 async function changeLogRequests($: EngineInterface, enabled: boolean): Promise<void> {
+  const company = (await loadConfig($)).judge === "decisions" ? "OpenAI" : "TypeSafe";
   await saveRow(
     $,
     LOG_KEY,
     enabled,
     enabled
-      ? `TypeSafe request logging on (all sessions). ${await sessionLogPath($)}`
-      : "TypeSafe request logging off (all sessions).",
+      ? `${company} request logging on (all sessions). ${await sessionLogPath($)}`
+      : `${company} request logging off (all sessions).`,
   );
 }
 
-async function changeSavedApiKey($: EngineInterface, text: string): Promise<boolean> {
+async function changeSavedApiKey(
+  $: EngineInterface,
+  text: string,
+  judge: JudgeName,
+): Promise<boolean> {
+  const { row, label } = SAVED_KEY[judge];
   return saveRow(
     $,
-    API_KEY_KEY,
-    parseSavedApiKey(text),
-    "TypeSafe API key saved (all sessions). Status shows the source, never the value.",
+    row,
+    parseSavedApiKey(text, judge),
+    `${label} saved (all sessions). Status shows the source, never the value.`,
   );
 }
 
-async function clearSavedApiKey($: EngineInterface): Promise<boolean> {
+async function clearSavedApiKey($: EngineInterface, judge: JudgeName): Promise<boolean> {
+  const { row, label } = SAVED_KEY[judge];
   return saveRow(
     $,
-    API_KEY_KEY,
+    row,
     "",
-    "Saved TypeSafe API key cleared (all sessions). Launch environment and .env still apply.",
+    `Saved ${label} cleared (all sessions). Launch environment and .env still apply.`,
   );
 }
 
@@ -825,7 +874,7 @@ async function statusText($: EngineInterface): Promise<string> {
       : "Waiting for fresh model usage.";
   const budget = config.contextBudgetTokens;
   const fraction = usageFraction(usage.context, budget);
-  return `Mode: ${config.mode}${config.mode === "auto" && !config.autoAcknowledged ? " (not confirmed)" : ""}. Minimum: ${formatTokens(config.minContextTokens)} tokens. Budget: ${budget > 0 ? `${formatTokens(budget)} tokens` : "off"}. Context: ${typeof tokens === "number" ? formatTokens(tokens) : "unknown"}${Number.isFinite(fraction) ? ` (${Math.round(fraction * 100)}% of the ${effectiveBudget(contextLimit(usage.context), budget) > 0 ? "budget" : "context limit"}; hint floor ${floorFor(fraction, parseProfile(config.profile)).toFixed(2)})` : ""}. ${formatKeyStatus((await resolvedKey($)).source)}. ${cooldown}${engine} Request log: ${config.logRequests ? await sessionLogPath($) : "off"}. Settings: /config (compact-adviser rows) and /compact-adviser.`;
+  return `Mode: ${config.mode}${config.mode === "auto" && !config.autoAcknowledged ? " (not confirmed)" : ""}. Judge: ${config.judge}. Minimum: ${formatTokens(config.minContextTokens)} tokens. Budget: ${budget > 0 ? `${formatTokens(budget)} tokens` : "off"}. Context: ${typeof tokens === "number" ? formatTokens(tokens) : "unknown"}${Number.isFinite(fraction) ? ` (${Math.round(fraction * 100)}% of the ${effectiveBudget(contextLimit(usage.context), budget) > 0 ? "budget" : "context limit"}; hint floor ${floorFor(fraction, parseProfile(config.profile, config.judge), config.judge).toFixed(2)})` : ""}. ${formatKeyStatus((await resolvedKey($, config.judge)).source)}. ${cooldown}${engine} Request log: ${config.logRequests ? await sessionLogPath($) : "off"}. Settings: /config (compact-adviser rows) and /compact-adviser.`;
 }
 
 async function snoozeOrDismiss($: EngineInterface, command: "snooze" | "dismiss") {
@@ -864,7 +913,8 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: COMMAND,
       description: "Configure persistent compaction advice, experimental auto, and token minimum",
-      argumentHint: "[auto|hint|off|status|threshold <tokens|default>|snooze|dismiss]",
+      argumentHint:
+        "[auto|hint|off|status|judge <decisions|jev>|threshold <tokens|default>|snooze|dismiss]",
     });
     try {
       const now = await $.clock.now();
@@ -1000,6 +1050,8 @@ export const register: Register = (on, options) => {
         await placeRing($, 40);
       } else if (["auto", "hint", "off"].includes(command) && !value) {
         await changeMode($, command as Mode);
+      } else if (command === "judge" && value) {
+        await changeJudge($, value);
       } else if (command === "budget" && value) {
         await changeBudget($, value);
       } else if (command === "threshold" && value) {
@@ -1021,6 +1073,10 @@ export const register: Register = (on, options) => {
   // Keep the saved key out of `/config` so the host menu never draws the secret.
   // Hidden rows still persist through $.config.set in the same settings path as mode.
   on("config.describe", { key: "compact-adviser.typesafeApiKey" }, async (_$, e, next) => {
+    const described = await next(e);
+    return { ...described, isHidden: true };
+  });
+  on("config.describe", { key: "compact-adviser.openaiApiKey" }, async (_$, e, next) => {
     const described = await next(e);
     return { ...described, isHidden: true };
   });
@@ -1089,8 +1145,10 @@ export const register: Register = (on, options) => {
         }),
       ]);
     }
-    const [rows, key] = await Promise.all([$.config.list(), resolvedKey($)]);
-    const savedKey = readSavedApiKey(rows, loadedOptions) !== undefined;
+    const [rows, key] = await Promise.all([$.config.list(), resolvedKey($, config.judge)]);
+    const savedKey = readSavedApiKey(rows, loadedOptions, config.judge) !== undefined;
+    const keyLabel = SAVED_KEY[config.judge].label;
+    const company = config.judge === "decisions" ? "OpenAI" : "TypeSafe";
 
     /** A list of rows the ring moves through; the one at `focus` takes it first. */
     const list = (
@@ -1146,9 +1204,17 @@ export const register: Register = (on, options) => {
         (mode) => run(() => changeMode($, mode, true)),
       );
     }
+    if (view === "judge") {
+      return options(
+        "Judge",
+        config.judge,
+        (["decisions", "jev"] as const).map((value) => ({ value, label: JUDGE_LABELS[value] })),
+        (judge) => run(() => changeJudge($, judge)),
+      );
+    }
     if (view === "logging") {
       return options(
-        "Log TypeSafe requests",
+        `Log ${company} requests`,
         config.logRequests ? "on" : "off",
         [
           { value: "off", label: "Off (default)" },
@@ -1190,10 +1256,14 @@ export const register: Register = (on, options) => {
     }
     if (view === "key") {
       return column([
-        heading("TypeSafe API key"),
-        Text({ dimColor: true, wrap: "wrap", children: keyDetail(key.source, savedKey) }),
+        heading(keyLabel),
+        Text({
+          dimColor: true,
+          wrap: "wrap",
+          children: keyDetail(key.source, savedKey, config.judge),
+        }),
         Input({
-          key: "typesafeApiKey",
+          key: SAVED_KEY[config.judge].option,
           label: "Key",
           value: keyDraft?.text ?? "",
           placeholder: savedKey ? "paste a key to replace the saved one" : "paste a key to save it",
@@ -1202,7 +1272,7 @@ export const register: Register = (on, options) => {
           onSubmit: (text: string) => {
             run(async () => {
               try {
-                if (await changeSavedApiKey($, text)) showMenu();
+                if (await changeSavedApiKey($, text, config.judge)) showMenu();
                 else keyDraft = { text };
               } catch (error) {
                 keyDraft = { text, error: errorMessage(error) };
@@ -1220,7 +1290,7 @@ export const register: Register = (on, options) => {
                     label: "Clear saved key",
                     onPress: () => {
                       run(async () => {
-                        if (await clearSavedApiKey($)) showMenu();
+                        if (await clearSavedApiKey($, config.judge)) showMenu();
                       });
                     },
                   },
@@ -1258,7 +1328,7 @@ export const register: Register = (on, options) => {
           },
           {
             key: "menu:logRequests",
-            label: setting("Log TypeSafe requests", config.logRequests ? "On" : "Off"),
+            label: setting(`Log ${company} requests`, config.logRequests ? "On" : "Off"),
             onPress: open(
               "logging",
               "menu:logRequests",
@@ -1266,9 +1336,18 @@ export const register: Register = (on, options) => {
             ),
           },
           {
-            key: "menu:typesafeApiKey",
-            label: setting("TypeSafe API key", KEY_SOURCE_LABELS[key.source]),
-            onPress: open("key", "menu:typesafeApiKey", "typesafeApiKey"),
+            key: `menu:${SAVED_KEY[config.judge].option}`,
+            label: setting(keyLabel, KEY_SOURCE_LABELS[key.source]),
+            onPress: open(
+              "key",
+              `menu:${SAVED_KEY[config.judge].option}`,
+              SAVED_KEY[config.judge].option,
+            ),
+          },
+          {
+            key: "menu:judge",
+            label: setting("Judge", JUDGE_LABELS[config.judge]),
+            onPress: open("judge", "menu:judge", `judge:${config.judge}`),
           },
           {
             key: "menu:reset",

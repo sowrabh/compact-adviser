@@ -5,19 +5,16 @@ import { claudeVersion, PACKAGE, run } from "./common.mjs";
 
 const version = claudeVersion();
 const { status, output } = run(["plugin", "validate", "--strict", PACKAGE]);
-const hooksUnquoted =
-  "hooks: session.start, prompt.submit, command.run, turn.start, turn.complete, session.compact, command.run{command=compact-adviser}, config.describe{key=compact-adviser.typesafeApiKey}, ui.close{id=compact-adviser}, ui.render{component=Pane}";
-// Measured, not assumed: pinned CI Claude Code 2.1.275 prints the key unquoted;
-// Claude Code 2.1.295 prints it quoted. Accept either.
-const hooksQuoted = hooksUnquoted.replace(
-  "config.describe{key=compact-adviser.typesafeApiKey}",
-  'config.describe{key="compact-adviser.typesafeApiKey"}',
-);
+const hooksLine =
+  "hooks: session.start, prompt.submit, command.run, turn.start, turn.complete, session.compact, command.run{command=compact-adviser}, config.describe{key=compact-adviser.typesafeApiKey}, config.describe{key=compact-adviser.openaiApiKey}, ui.close{id=compact-adviser}, ui.render{component=Pane}";
+// Measured, not assumed: Claude Code 2.1.275 prints matcher keys unquoted and 2.1.295 and
+// later quote them. Compare with the quotes taken out.
+const normalized = output.replace(/\{key="([^"]*)"\}/g, "{key=$1}");
 const expected = [
-  "env reads: CLAUDE_CODE_ENABLE_FUNCTION_HOOKS, COMPACT_ADVISER_DISABLE, COMPACT_ADVISER_TEST_ENDPOINT, HOME, TYPESAFE_API_KEY, TYPESAFE_BASE",
+  "env reads: CLAUDE_CODE_ENABLE_FUNCTION_HOOKS, COMPACT_ADVISER_DISABLE, COMPACT_ADVISER_TEST_ENDPOINT, HOME, OPENAI_DECISIONS_API_KEY, TYPESAFE_API_KEY, TYPESAFE_BASE",
   "env writes: nothing",
-  "$.fs.read (via appendTypeSafeLog, resolvedKey)",
-  "$.fs.write (via appendTypeSafeLog)",
+  "$.fs.read (via appendRequestLog, resolvedKey)",
+  "$.fs.write (via appendRequestLog)",
   "Validation passed",
 ];
 // `prompt.submit` is intentional: confirmed auto mode may submit `beforeCompactPrompt`.
@@ -25,7 +22,7 @@ const expected = [
 const forbidden = ["process.run", "env.set", "prompt.fill", "tool.call", "model."];
 const problems = [
   ...(status === 0 ? [] : [`exit status ${status}`]),
-  ...(output.includes(hooksUnquoted) || output.includes(hooksQuoted)
+  ...(normalized.includes(hooksLine)
     ? []
     : [`missing hooks line (prompt.submit, and the other registered events)`]),
   ...expected.filter((line) => !output.includes(line)).map((line) => `missing: ${line}`),

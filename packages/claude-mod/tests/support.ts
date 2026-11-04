@@ -9,6 +9,7 @@ import { type MockClock, mock } from "claude-code/testing";
 
 export const PLUGIN = "compact-adviser";
 export const KEY = "tsk-fixture-key-1234567890";
+export const OPENAI_KEY = "sk-openai-fixture-key-0987654321";
 export const SESSION = "session-1";
 export const START = 1_000_000;
 
@@ -58,6 +59,24 @@ export function jevAnswer(v: Verdict = {}) {
   };
 }
 
+/** A Decisions reply: one probability per predicate. */
+export function decisionsAnswer(v: Verdict = {}) {
+  return {
+    model: "gpt-6-luna",
+    answers: [
+      { type: "predicate", name: "finished", probability: v.completed ?? 0.99 },
+      { type: "predicate", name: "hands_on", probability: v.handsOn ?? 0.99 },
+    ],
+    usage: {
+      input_tokens: 8200,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      output_tokens: 0,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 8200,
+    },
+  };
+}
+
 export type World = {
   clock: MockClock;
   store: Map<string, unknown>;
@@ -91,6 +110,11 @@ export type WorldOptions = {
   /** The `COMPACT_ADVISER_DISABLE` kill switch; omit to leave the variable unset. */
   disable?: string;
   key?: string | undefined;
+  /** `OPENAI_DECISIONS_API_KEY` in the launch environment; omit to leave it unset. */
+  openaiKey?: string;
+  /** The `judge` row; "absent" leaves it to the manifest default. Upstream's suites run as Jev. */
+  judge?: "decisions" | "jev" | "absent" | string;
+  savedOpenaiKey?: string;
   endpoint?: string;
   /** The `TYPESAFE_BASE` override; omit to leave the variable unset. */
   base?: string;
@@ -140,6 +164,7 @@ export function world(on: On, options: WorldOptions = {}): World {
     HOME: "/tmp/fixture-home",
     ...(functionHooks === undefined ? {} : { CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: functionHooks }),
     ...(key === undefined ? {} : { TYPESAFE_API_KEY: key }),
+    ...(options.openaiKey === undefined ? {} : { OPENAI_DECISIONS_API_KEY: options.openaiKey }),
     ...(options.endpoint === undefined ? {} : { COMPACT_ADVISER_TEST_ENDPOINT: options.endpoint }),
     ...(options.disable === undefined ? {} : { COMPACT_ADVISER_DISABLE: options.disable }),
     ...(options.base === undefined ? {} : { TYPESAFE_BASE: options.base }),
@@ -188,7 +213,10 @@ export function world(on: On, options: WorldOptions = {}): World {
     [`${PLUGIN}.minContextTokens`, options.minimum ?? 40000],
     [`${PLUGIN}.logRequests`, options.logRequests ?? false],
     [`${PLUGIN}.typesafeApiKey`, options.savedKey ?? ""],
+    [`${PLUGIN}.openaiApiKey`, options.savedOpenaiKey ?? ""],
   ]);
+  const judge = options.judge ?? "jev";
+  if (judge !== "absent") rows.set(`${PLUGIN}.judge`, judge);
   let configDenial: string | undefined;
   const w: World = {
     clock,
@@ -199,7 +227,12 @@ export function world(on: On, options: WorldOptions = {}): World {
     answers: [],
     usage: { tokens: 60000, window: 200000, autoCompactThreshold: 167000 },
     messages: longConversation(),
-    respond: async () => ({ status: 200, text: JSON.stringify(jevAnswer()) }),
+    respond: async (body) => ({
+      status: 200,
+      text: JSON.stringify(
+        JSON.parse(body).model === "gpt-6-luna" ? decisionsAnswer() : jevAnswer(),
+      ),
+    }),
     compact: async () => ({
       messages: [{ role: "user", text: "This session is being continued", toolUses: [] }],
       tokensBefore: 60000,
@@ -328,7 +361,7 @@ export function world(on: On, options: WorldOptions = {}): World {
   });
   on("ui.open", async (_$, e) => {
     journal.opened.push({ id: e.id, focus: e.focus });
-    return { value: undefined };
+    return { value: { isPlaced: true as const } };
   });
   on("ui.close", async (_$, e) => {
     journal.closed.push(e.id);

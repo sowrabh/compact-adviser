@@ -14,16 +14,22 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ConfigStore } from "./config.ts";
+import { ConfigStore, SAVED_KEY, selectedJudge } from "./config.ts";
 import { DISABLE_ENV, disabledByEnv } from "./disable.ts";
-import { parseDotenvKey, type ResolvedTypesafeApiKey, resolveTypesafeApiKey } from "./env.ts";
+import { parseDotenvKey, type ResolvedApiKey, resolveApiKey } from "./env.ts";
 import {
+  API_KEY_ENV,
+  DECISIONS_ENDPOINT,
+  decide,
+  decisionsRequestBody,
   effectiveBudget,
   JudgeError,
+  type JudgeName,
   judge,
   qualifies,
   requestBody,
   typesafeEndpoint,
+  type Verdict,
 } from "./judge.ts";
 import {
   appendRequestLogLine,
@@ -43,7 +49,7 @@ export const HINT =
   "Compact adviser: work appears completed or recorded. Run /compact to save tokens.";
 /** Below this the conversation is too small for a judgment to be worth a request. */
 export const MINIMUM_CONVERSATION_TOKENS = 20000;
-/** A loopback-only endpoint override for the live regression's local TypeSafe fixture. */
+/** A loopback-only endpoint override for the live regression's local judge fixture. */
 const LOOPBACK_ENDPOINT = /^http:\/\/127\.0\.0\.1:\d{1,5}\/[\x21-\x7e]*$/;
 
 export interface HookPayload {
@@ -63,7 +69,7 @@ export interface HookOutput {
 
 /**
  * Only the interactive TUI judges. `codex exec` and other scripted runners settle the same
- * way, but a hint no person is watching is only a TypeSafe request nobody asked for.
+ * way, but a hint no person is watching is only a judge request nobody asked for.
  */
 export function isInteractive(rollout: Pick<Rollout, "originator">): boolean {
   return rollout.originator === "codex-tui";
@@ -74,26 +80,34 @@ function testEndpoint(env: NodeJS.ProcessEnv): string | undefined {
   return value !== undefined && LOOPBACK_ENDPOINT.test(value) ? value : undefined;
 }
 
-/** The live regression's fixture, else TypeSafe under `TYPESAFE_BASE` from the launch environment. */
-function judgeEndpoint(env: NodeJS.ProcessEnv): string {
-  const endpoint = testEndpoint(env) ?? typesafeEndpoint(env.TYPESAFE_BASE);
+/**
+ * The live regression's fixture, else the selected judge's endpoint: OpenAI's Decisions API, or
+ * TypeSafe under `TYPESAFE_BASE` from the launch environment.
+ */
+function judgeEndpoint(env: NodeJS.ProcessEnv, judgeName: JudgeName): string {
+  const fixture = testEndpoint(env);
+  if (fixture !== undefined) return fixture;
+  if (judgeName === "decisions") return DECISIONS_ENDPOINT;
+  const endpoint = typesafeEndpoint(env.TYPESAFE_BASE);
   if (endpoint === undefined) throw new JudgeError("configuration");
   return endpoint;
 }
 
-/** Launch environment, then the key saved in settings, then `TYPESAFE_API_KEY` in `cwd/.env`. */
+/** A judge's key: launch environment, then the key saved in settings, then `cwd/.env`. */
 export function resolveKey(
   env: NodeJS.ProcessEnv,
   saved: string | undefined,
   cwd: string,
-): ResolvedTypesafeApiKey {
+  judgeName: JudgeName = "jev",
+): ResolvedApiKey {
+  const name = API_KEY_ENV[judgeName];
   let dotenv: string | undefined;
   try {
-    dotenv = parseDotenvKey(readFileSync(join(cwd, ".env"), "utf8"), "TYPESAFE_API_KEY");
+    dotenv = parseDotenvKey(readFileSync(join(cwd, ".env"), "utf8"), name);
   } catch {
     dotenv = undefined;
   }
-  return resolveTypesafeApiKey(env.TYPESAFE_API_KEY, saved, dotenv);
+  return resolveApiKey(env[name], saved, dotenv);
 }
 
 async function checkpointKey(text: string): Promise<string> {
@@ -149,7 +163,7 @@ function cancellableJudgeTransport(fetch: Environment["fetch"]): {
 
 /**
  * One completed Codex turn: count the exchange, run the cheap local gates, and only then ask
- * TypeSafe. A failed or unqualified judgment returns no hint and leaves context alone.
+ * the selected judge. A failed or unqualified judgment returns no hint and leaves context alone.
  */
 async function onStop(payload: HookPayload, environment: Environment): Promise<HookOutput> {
   const sessionId = payload.session_id;
@@ -161,7 +175,8 @@ async function onStop(payload: HookPayload, environment: Environment): Promise<H
 
   const root = adviserRoot(environment.env);
   const config = new ConfigStore(root).read();
-  const profile = parseProfile(config.profile);
+  const judgeName = selectedJudge(config);
+  const profile = parseProfile(config.profile, judgeName);
   const sessions = new SessionStore(root);
   const now = environment.now();
 
@@ -175,7 +190,12 @@ async function onStop(payload: HookPayload, environment: Environment): Promise<H
   if (!isInteractive(rollout)) return {};
   if (!payload.last_assistant_message?.trim()) return {};
 
-  const key = resolveKey(environment.env, config.typesafeApiKey, payload.cwd ?? process.cwd());
+  const key = resolveKey(
+    environment.env,
+    config[SAVED_KEY[judgeName].field],
+    payload.cwd ?? process.cwd(),
+    judgeName,
+  );
   if (!key.value) return {};
 
   const tokens = rollout.tokens;
@@ -183,34 +203,35 @@ async function onStop(payload: HookPayload, environment: Environment): Promise<H
   if (tokens < config.minContextTokens) return {};
   if (cooldownReason(state, tokens, now) !== undefined) return {};
 
-  const view = snapshot(rollout.messages, [key.value, config.typesafeApiKey], {
+  const view = snapshot(rollout.messages, [key.value, config.typesafeApiKey, config.openaiApiKey], {
     truncated: rollout.truncated,
   });
   if (view.conversationTokens <= MINIMUM_CONVERSATION_TOKENS) return {};
   const fingerprint = await checkpointKey(view.checkpointText);
   if (state.lastHintKey === fingerprint) return {};
 
+  const body = () =>
+    judgeName === "decisions" ? decisionsRequestBody(view.state) : requestBody(view.state, profile);
   let loggedBody: string | undefined;
   if (config.logRequests) {
     try {
-      loggedBody = requestBody(view.state, profile);
+      loggedBody = body();
       appendRequestLogLine(root, sessionId, requestLogLine(loggedBody));
     } catch {
       // Request logging must not replace or delay the judgment.
     }
   }
 
-  let result: Awaited<ReturnType<typeof judge>>;
+  let result: Verdict;
   try {
-    result = await judge(
-      view.state,
-      key.value,
-      {
-        ...cancellableJudgeTransport(environment.fetch),
-        endpoint: judgeEndpoint(environment.env),
-      },
-      profile,
-    );
+    const transport = {
+      ...cancellableJudgeTransport(environment.fetch),
+      endpoint: judgeEndpoint(environment.env, judgeName),
+    };
+    result =
+      judgeName === "decisions"
+        ? await decide(view.state, key.value, transport)
+        : await judge(view.state, key.value, transport, profile);
   } catch (error) {
     if (config.logRequests) {
       try {
@@ -224,7 +245,7 @@ async function onStop(payload: HookPayload, environment: Environment): Promise<H
       }
     }
     // Silence is the only honest report here: Codex's one channel is a permanent scrollback
-    // line, and a transient TypeSafe failure is not worth one. Backoff keeps retries rare.
+    // line, and a transient judge failure is not worth one. Backoff keeps retries rare.
     const current = sessions.read(sessionId, environment.now()).state;
     sessions.write(sessionId, backoff(current, environment.now()), usage);
     return {};
@@ -237,7 +258,7 @@ async function onStop(payload: HookPayload, environment: Environment): Promise<H
         root,
         sessionId,
         responseLogLine(
-          loggedBody ?? requestBody(view.state, profile),
+          loggedBody ?? body(),
           result,
           fraction,
           undefined,
@@ -259,6 +280,7 @@ async function onStop(payload: HookPayload, environment: Environment): Promise<H
     tokens < latestConfig.minContextTokens ||
     cooldownReason(current, tokens, nowAfter) !== undefined ||
     latestConfig.profile !== config.profile ||
+    latestConfig.judge !== config.judge ||
     latestConfig.contextBudgetTokens !== config.contextBudgetTokens ||
     !qualifies(result, fraction, profile)
   ) {

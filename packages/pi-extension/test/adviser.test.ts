@@ -830,3 +830,78 @@ test("Jev questions in a profile disable advice while Decisions is selected", as
   assert.equal(requests.length, 0);
   assert.ok(!showedHint(h));
 });
+
+function judgment(finished: number, handsOn: number) {
+  return parseJudgment(apiResponse(finished, handsOn));
+}
+
+test("walking away from a finished checkpoint compacts at the idle point, without a second judgment", async (t) => {
+  // 0.99 x (0.5 + 0.5 x 0.2) = 0.594: under the 16%-usage floor, over the 0.5 idle bar.
+  const h = harness(t, async () => judgment(0.99, 0.2));
+  h.enable("auto");
+  await h.fire("agent_settled");
+  assert.equal(h.compactions.length, 0);
+  assert.equal(h.calls, 1);
+  assert.deepEqual(
+    h.timers.map((timer) => timer.ms),
+    [50 * 60_000],
+  );
+  await h.elapse();
+  assert.equal(h.compactions.length, 1);
+  assert.equal(h.calls, 1);
+});
+
+test("an unfinished checkpoint, hint mode, or a failed judgment never compacts at the idle point", async (t) => {
+  for (const [mode, evaluate] of [
+    ["auto", async () => judgment(0.3, 1)],
+    ["hint", async () => judgment(0.99, 0.2)],
+    [
+      "auto",
+      async () => {
+        throw new JudgeError("server");
+      },
+    ],
+  ] as const) {
+    const h = harness(t, evaluate as never);
+    h.enable(mode);
+    await h.fire("agent_settled");
+    await h.elapse();
+    assert.equal(h.compactions.length, 0, mode);
+  }
+});
+
+test("typing, a draft, or new input before the idle point cancels it", async (t) => {
+  for (const activity of ["typing", "draft", "input"] as const) {
+    const h = harness(t, async () => judgment(0.99, 0.2));
+    h.enable("auto");
+    await h.fire("session_start");
+    await h.fire("agent_settled");
+    if (activity === "typing") h.type();
+    else if (activity === "draft") h.editorText = "half a thought";
+    else await h.fire("input", { type: "input", text: "next", source: "interactive" });
+    await h.elapse();
+    assert.equal(h.compactions.length, 0, activity);
+  }
+});
+
+test("idleMinutes and Pi's cache retention set the idle point", async (t) => {
+  const h = harness(t, async () => judgment(0.99, 0.2));
+  h.enable("auto");
+  h.store.update({ idleMinutes: 15 } as never);
+  await h.fire("agent_settled");
+  assert.deepEqual(
+    h.timers.map((timer) => timer.ms),
+    [15 * 60_000],
+  );
+});
+
+test("an acknowledgement saved before walk-away compaction existed does not confirm auto", async (t) => {
+  const h = harness(t, async () => judgment(0.99, 0.99));
+  h.store.update({ mode: "auto", autoAcknowledged: true });
+  await h.fire("agent_settled");
+  await h.elapse();
+  assert.equal(h.compactions.length, 0);
+  h.confirms.push(true);
+  await h.command("auto");
+  assert.equal((h.store.read() as { consentVersion?: number }).consentVersion, 2);
+});

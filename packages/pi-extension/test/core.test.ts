@@ -680,3 +680,19 @@ test("TypeSafe log append keeps prior lines", (t) => {
   assert.equal(lines[1].id, requestLogId(body));
   assert.notEqual(lines[0].id, lines[1].id);
 });
+
+test("the walk-away point follows Pi's cache retention, else falls back to 50 minutes", async () => {
+  const { idleDelayMs, piCacheTtl } = await import("../src/idle.ts");
+  const MINUTE = 60_000;
+  assert.deepEqual(piCacheTtl("anthropic-messages", undefined), { ttlMs: 5 * MINUTE, known: true });
+  assert.deepEqual(piCacheTtl("anthropic-messages", "long"), { ttlMs: 60 * MINUTE, known: true });
+  assert.deepEqual(piCacheTtl("bedrock-converse-stream", "long"), {
+    ttlMs: 60 * MINUTE,
+    known: true,
+  });
+  assert.deepEqual(piCacheTtl("openai-responses", "long"), { ttlMs: 60 * MINUTE, known: false });
+  assert.deepEqual(piCacheTtl(undefined, undefined), { ttlMs: 60 * MINUTE, known: false });
+  assert.equal(idleDelayMs(piCacheTtl("anthropic-messages", undefined), 0), 4 * MINUTE);
+  assert.equal(idleDelayMs(piCacheTtl(undefined, undefined), 0), 50 * MINUTE);
+  assert.equal(idleDelayMs(piCacheTtl(undefined, undefined), 15), 15 * MINUTE);
+});

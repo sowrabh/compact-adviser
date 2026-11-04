@@ -5,6 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
+  autoConfirmed,
   type Config,
   ConfigStore,
   DEFAULT_CONFIG,
@@ -19,6 +20,7 @@ import {
 import { snapshot } from "./context.ts";
 import { DISABLE_ENV, disabledByEnv } from "./disable.ts";
 import { formatKeyStatus, type ResolvedApiKey, resolveApiKey } from "./env.ts";
+import { idleDelayMs, piCacheTtl } from "./idle.ts";
 import {
   API_KEY_ENV,
   contextPressure,
@@ -27,12 +29,14 @@ import {
   decisionsRequestBody,
   effectiveBudget,
   floorFor,
+  idleFloor,
   JudgeError,
   type JudgeName,
   judge,
   judgeUnavailableMessage,
   qualifies,
   requestBody,
+  score,
   typesafeEndpoint,
   type Verdict,
 } from "./judge.ts";
@@ -58,6 +62,8 @@ interface Options {
   version: string;
   key?: () => string | undefined;
   now?: () => number;
+  /** Runs `fn` after `ms`; returns a cancel. Tests drive it instead of real time. */
+  setTimer?: (fn: () => void, ms: number) => () => void;
   evaluate?: (
     state: unknown,
     key: string,
@@ -117,6 +123,24 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
   let automaticCompaction = false;
   let hintVisible = false;
   let diagnostic = "";
+  // The walk-away plan for the latest settled answer: armed at its turn end, dropped at any
+  // sign of the person, and fired once just before the prompt cache would lapse.
+  let away:
+    | { seq: number; generation: number; lifetime: number; score?: number; cancel: () => void }
+    | undefined;
+  let awaySeq = 0;
+  let stopTyping: (() => void) | undefined;
+  const setTimer =
+    options.setTimer ??
+    ((fn: () => void, ms: number) => {
+      const timer = setTimeout(fn, ms);
+      timer.unref?.();
+      return () => clearTimeout(timer);
+    });
+  function cancelAway() {
+    away?.cancel();
+    away = undefined;
+  }
   const active = (ctx: ExtensionContext) => ctx.mode === "tui" && ctx.hasUI;
   function persist(state: SessionState) {
     pi.appendEntry(STATE_TYPE, state);
@@ -137,6 +161,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
     }
   }
   function invalidate(ctx: ExtensionContext) {
+    cancelAway();
     generation++;
     request?.abort();
     request = undefined;
@@ -180,6 +205,70 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
       ctx.model?.id,
     ]);
   }
+  function startCompaction(ctx: ExtensionContext, when: "checkpoint" | "away") {
+    compacting = true;
+    automaticCompaction = true;
+    const owner = lifetime;
+    ctx.ui.notify(
+      when === "away"
+        ? "Compact adviser: compacting while you are away (experimental auto)."
+        : "Compact adviser: compacting at a checkpoint (experimental auto).",
+      "info",
+    );
+    ctx.compact({
+      onComplete: () => {
+        if (lifetime !== owner) return;
+        compacting = false;
+        automaticCompaction = false;
+        // session_compact owns the successful checkpoint reset, including native compactions.
+        refresh(ctx);
+        ctx.ui.notify("Compact adviser: compaction completed.", "info");
+      },
+      onError: () => {
+        if (lifetime !== owner) return;
+        compacting = false;
+        automaticCompaction = false;
+        const latestState = restoreState(ctx.sessionManager.getBranch());
+        persist({ ...latestState, retryAfter: now() + 60000 });
+        notice(
+          ctx,
+          "Compaction failed or was cancelled. No immediate retry; Pi remains in control.",
+        );
+      },
+    });
+  }
+  /** Arms the walk-away decision for the answer that just settled, in confirmed auto only. */
+  function armAway(ctx: ExtensionContext, config: Config) {
+    cancelAway();
+    if (config.mode !== "auto" || !autoConfirmed(config)) return;
+    const seq = ++awaySeq;
+    const delay = idleDelayMs(
+      piCacheTtl(ctx.model?.api, process.env.PI_CACHE_RETENTION),
+      config.idleMinutes ?? 0,
+    );
+    away = { seq, generation, lifetime, cancel: setTimer(() => onAway(ctx, seq), delay) };
+  }
+  /**
+   * The idle point: the person has been away since the answer settled. A turn-end score at or
+   * above the schedule's loosest floor compacts once; anything else, including no judgment,
+   * leaves context alone.
+   */
+  function onAway(ctx: ExtensionContext, seq: number) {
+    const plan = away;
+    if (plan?.seq !== seq || plan.generation !== generation || plan.lifetime !== lifetime) return;
+    away = undefined;
+    let config: Config;
+    try {
+      config = store.read();
+    } catch {
+      return;
+    }
+    if (config.mode !== "auto" || !autoConfirmed(config) || plan.score === undefined) return;
+    if (eligible(ctx, config, restoreState(ctx.sessionManager.getBranch())) === undefined) return;
+    const judgeName = selectedJudge(config);
+    if (plan.score < idleFloor(parseProfile(config.profile, judgeName), judgeName)) return;
+    startCompaction(ctx, "away");
+  }
   async function settled(ctx: ExtensionContext) {
     if (!active(ctx)) return;
     let state = restoreState(ctx.sessionManager.getBranch());
@@ -202,6 +291,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
       refresh(ctx);
       return;
     }
+    armAway(ctx, config);
     if (request || eligible(ctx, config, state) === undefined) return;
     const judgeName = selectedJudge(config);
     const profile = parseProfile(config.profile, judgeName);
@@ -264,10 +354,12 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
       state = { ...state, failures: 0, retryAfter: 0 };
       const auto = latest.mode === "auto";
       if (!qualifies(result, usageFraction(ctx, latest), profile)) {
+        // Not this checkpoint's moment; the walk-away decision weighs the same score later.
+        if (away?.generation === epoch) away.score = score(result, profile);
         persist(state);
         return;
       }
-      if (auto && !latest.autoAcknowledged) {
+      if (auto && !autoConfirmed(latest)) {
         persist(state);
         return;
       }
@@ -278,31 +370,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
         ctx.ui.setWidget(LABEL, (_tui, theme) => new Text(theme.fg("warning", HINT), 0, 0));
         hintVisible = true;
       } else {
-        compacting = true;
-        automaticCompaction = true;
-        const owner = lifetime;
-        ctx.ui.notify("Compact adviser: compacting at a checkpoint (experimental auto).", "info");
-        ctx.compact({
-          onComplete: () => {
-            if (lifetime !== owner) return;
-            compacting = false;
-            automaticCompaction = false;
-            // session_compact owns the successful checkpoint reset, including native compactions.
-            refresh(ctx);
-            ctx.ui.notify("Compact adviser: compaction completed.", "info");
-          },
-          onError: () => {
-            if (lifetime !== owner) return;
-            compacting = false;
-            automaticCompaction = false;
-            const latestState = restoreState(ctx.sessionManager.getBranch());
-            persist({ ...latestState, retryAfter: now() + 60000 });
-            notice(
-              ctx,
-              "Compaction failed or was cancelled. No immediate retry; Pi remains in control.",
-            );
-          },
-        });
+        startCompaction(ctx, "checkpoint");
       }
     } catch (error) {
       if (!current()) return;
@@ -336,6 +404,15 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
   pi.on("session_start", (_event, ctx) => {
     lifetime++;
     invalidate(ctx);
+    stopTyping?.();
+    // Raw keys mean the person is at the keyboard: drop a pending walk-away decision. Never
+    // consumes the input.
+    stopTyping = active(ctx)
+      ? ctx.ui.onTerminalInput?.(() => {
+          cancelAway();
+          return undefined;
+        })
+      : undefined;
     compacting = false;
     automaticCompaction = false;
     clearStatus(ctx);
@@ -397,6 +474,8 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
   pi.on("session_shutdown", (_event, ctx) => {
     lifetime++;
     invalidate(ctx);
+    stopTyping?.();
+    stopTyping = undefined;
     compacting = false;
     automaticCompaction = false;
     clearStatus(ctx);
@@ -411,18 +490,18 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
   async function changeMode(ctx: ExtensionCommandContext, mode: Mode) {
     if (mode === "auto") {
       if (!supported) throw new Error("Automatic mode requires Pi 0.82.0 or newer.");
-      if (!store.read().autoAcknowledged) {
+      if (!autoConfirmed(store.read())) {
         if (
           !(await ctx.ui.confirm(
             "Enable experimental automatic compaction?",
-            "This persists across all Pi sessions and projects. Compaction is lossy and timing accuracy is not proven. It only acts at eligible checkpoints; it does not compact immediately.",
+            "This persists across all Pi sessions and projects. Compaction is lossy and timing accuracy is not proven. It acts at eligible checkpoints, and when you walk away from a settled answer it compacts a finished session just before its prompt cache lapses. It does not compact immediately.",
           ))
         )
           return;
       }
       save(
         ctx,
-        { mode, autoAcknowledged: true },
+        { mode, autoAcknowledged: true, consentVersion: 2 },
         `Automatic mode saved (all sessions). ${currentJudge(store) === "decisions" ? "An OpenAI" : "A TypeSafe"} key is still required.`,
       );
     } else

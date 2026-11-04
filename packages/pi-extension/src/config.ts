@@ -24,7 +24,14 @@ export interface Config {
   /** Tokens at which the hint floor is fully relaxed; 0 uses the model's window. */
   contextBudgetTokens: number;
   autoAcknowledged: boolean;
+  /**
+   * 2 once automatic mode was acknowledged with walk-away compaction in its disclosure; an
+   * acknowledgement without it predates that and does not confirm auto.
+   */
+  consentVersion?: 2;
   logRequests: boolean;
+  /** Minutes after a settled answer before walk-away compaction; 0 follows the cache TTL. */
+  idleMinutes?: number;
   /** Which model answers the two questions; absent means the Decisions judge. */
   judge?: JudgeName;
   typesafeApiKey?: string;
@@ -35,6 +42,11 @@ export interface Config {
 /** The judge a configuration selects. */
 export function selectedJudge(config: Config): JudgeName {
   return config.judge ?? DEFAULT_JUDGE;
+}
+
+/** Whether automatic mode was acknowledged with its current disclosure. */
+export function autoConfirmed(config: Config): boolean {
+  return config.autoAcknowledged && config.consentVersion === 2;
 }
 
 /** Each judge's saved-key field and the words the menu and messages use for it. */
@@ -110,7 +122,10 @@ function validate(value: unknown): Config {
     (c.logRequests !== undefined && typeof c.logRequests !== "boolean") ||
     (c.typesafeApiKey !== undefined && typeof c.typesafeApiKey !== "string") ||
     (c.openaiApiKey !== undefined && typeof c.openaiApiKey !== "string") ||
-    (c.judge !== undefined && !JUDGES.includes(c.judge as JudgeName))
+    (c.judge !== undefined && !JUDGES.includes(c.judge as JudgeName)) ||
+    (c.consentVersion !== undefined && c.consentVersion !== 2) ||
+    (c.idleMinutes !== undefined &&
+      (typeof c.idleMinutes !== "number" || !Number.isFinite(c.idleMinutes) || c.idleMinutes < 0))
   ) {
     throw new Error("Invalid or unsupported settings. Restore a valid version-1 configuration.");
   }
@@ -132,7 +147,9 @@ function validate(value: unknown): Config {
     minContextTokens: c.minContextTokens,
     contextBudgetTokens: (c.contextBudgetTokens as number | undefined) ?? 0,
     autoAcknowledged: c.autoAcknowledged,
+    ...(c.consentVersion === 2 ? { consentVersion: 2 as const } : {}),
     logRequests: c.logRequests === true,
+    ...(typeof c.idleMinutes === "number" ? { idleMinutes: c.idleMinutes } : {}),
     ...(judge !== undefined ? { judge } : {}),
     ...(typesafeApiKey !== undefined ? { typesafeApiKey } : {}),
     ...(openaiApiKey !== undefined ? { openaiApiKey } : {}),

@@ -118,7 +118,10 @@ export function harness(
   let tokens: number | null = 45000,
     idle = true,
     pending = false,
-    clock = 100000;
+    clock = 100000,
+    editorText = "";
+  const timers: { ms: number; fn: () => void; cancelled: boolean }[] = [];
+  const inputHandlers: ((data: string) => unknown)[] = [];
   const ctx = {
     mode: "tui",
     hasUI: true,
@@ -183,6 +186,11 @@ export function harness(
         return result;
       },
       confirm: async () => confirms.shift() ?? true,
+      getEditorText: () => editorText,
+      onTerminalInput: (handler: (data: string) => unknown) => {
+        inputHandlers.push(handler);
+        return () => inputHandlers.splice(inputHandlers.indexOf(handler), 1);
+      },
     },
     isIdle: () => idle,
     hasPendingMessages: () => pending,
@@ -219,6 +227,13 @@ export function harness(
       version,
       ...(credential === false ? {} : { key: () => credential }),
       now: () => clock,
+      setTimer: (fn: () => void, ms: number) => {
+        const timer = { ms, fn, cancelled: false };
+        timers.push(timer);
+        return () => {
+          timer.cancelled = true;
+        };
+      },
       ...(hostJudge
         ? {}
         : {
@@ -269,6 +284,18 @@ export function harness(
     get calls() {
       return calls;
     },
+    timers,
+    /** Runs every pending timer once, as if its time had come. */
+    elapse: async () => {
+      for (const timer of timers.splice(0)) if (!timer.cancelled) timer.fn();
+      await flush();
+    },
+    type: (data = "w") => {
+      for (const handler of [...inputHandlers]) handler(data);
+    },
+    set editorText(value: string) {
+      editorText = value;
+    },
     set tokens(value: number | null) {
       tokens = value;
     },
@@ -282,6 +309,10 @@ export function harness(
       clock = value;
     },
     enable: (mode: "hint" | "auto" = "hint") =>
-      store.update({ mode, autoAcknowledged: mode === "auto" }),
+      store.update({
+        mode,
+        autoAcknowledged: mode === "auto",
+        ...(mode === "auto" ? { consentVersion: 2 } : {}),
+      } as never),
   };
 }

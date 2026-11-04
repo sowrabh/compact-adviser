@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as claudeDisable from "../../claude-mod/lib/disable.ts";
+import * as claudeIdle from "../../claude-mod/lib/idle.ts";
 import * as claude from "../../claude-mod/lib/judge.ts";
 import * as claudeLog from "../../claude-mod/lib/log.ts";
 import * as claudeSnapshot from "../../claude-mod/lib/snapshot.ts";
@@ -26,6 +27,7 @@ import * as grokSnapshot from "../../grok-plugin/lib/snapshot.ts";
 import * as grokState from "../../grok-plugin/lib/state.ts";
 import * as piContext from "../src/context.ts";
 import * as piDisable from "../src/disable.ts";
+import * as piIdle from "../src/idle.ts";
 import * as pi from "../src/judge.ts";
 import * as piLog from "../src/log.ts";
 import * as piState from "../src/state.ts";
@@ -763,4 +765,13 @@ test("every package scrubs the saved OpenAI key field the same way as the TypeSa
     assert.ok(!clean.text.includes(secret));
   }
   assert.ok(piContext.redactOwnedSettings(dump).text.includes("decisions"));
+});
+
+test("Pi and Claude Code place the walk-away point the same way for the same cache", () => {
+  for (const ttlMs of [5 * 60_000, 60 * 60_000]) {
+    for (const minutes of [0, 1, 20, 90]) {
+      const ttl = { ttlMs, known: true, caching: true };
+      assert.equal(piIdle.idleDelayMs(ttl, minutes), claudeIdle.idleDelayMs(ttl, minutes));
+    }
+  }
 });

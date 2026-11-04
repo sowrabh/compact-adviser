@@ -91,6 +91,8 @@ export function harness(
   initTheme("dark", false);
   const dir = temp(t),
     store = new ConfigStore(dir);
+  // Upstream's suites run as the Jev judge; the Decisions default has its own tests.
+  store.update({ judge: "jev" } as never);
   const sm = SessionManager.create(dir, join(dir, "sessions"));
   sm.appendMessage({
     role: "user",

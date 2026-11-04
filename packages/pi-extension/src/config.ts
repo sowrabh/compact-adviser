@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { lockSync } from "proper-lockfile";
+import { DEFAULT_JUDGE, JUDGES, type JudgeName } from "./judge.ts";
 import { parseProfile } from "./profile.ts";
 
 export type Mode = "hint" | "auto" | "off";
@@ -24,8 +25,31 @@ export interface Config {
   contextBudgetTokens: number;
   autoAcknowledged: boolean;
   logRequests: boolean;
+  /** Which model answers the two questions; absent means the Decisions judge. */
+  judge?: JudgeName;
   typesafeApiKey?: string;
+  openaiApiKey?: string;
   profile?: string;
+}
+
+/** The judge a configuration selects. */
+export function selectedJudge(config: Config): JudgeName {
+  return config.judge ?? DEFAULT_JUDGE;
+}
+
+/** Each judge's saved-key field and the words the menu and messages use for it. */
+export const SAVED_KEY: Readonly<
+  Record<JudgeName, { field: "openaiApiKey" | "typesafeApiKey"; label: string; article: string }>
+> = {
+  decisions: { field: "openaiApiKey", label: "OpenAI API key", article: "an" },
+  jev: { field: "typesafeApiKey", label: "TypeSafe API key", article: "a" },
+};
+
+/** A judge name, or the reason it is not one. */
+export function parseJudge(text: string): JudgeName {
+  const value = text.trim();
+  if (!JUDGES.includes(value as JudgeName)) throw new Error("Choose a judge: decisions or jev.");
+  return value as JudgeName;
 }
 export const DEFAULT_CONFIG: Readonly<Config> = Object.freeze({
   version: 1,
@@ -53,11 +77,12 @@ export function parseBudget(text: string): number {
   }
   return number;
 }
-export function parseSavedApiKey(text: string): string {
+export function parseSavedApiKey(text: string, judge: JudgeName = "jev"): string {
   const value = text.trim();
-  if (!value) throw new Error("Enter a TypeSafe API key, or cancel to leave it unchanged.");
+  const { label, article } = SAVED_KEY[judge];
+  if (!value) throw new Error(`Enter ${article} ${label}, or cancel to leave it unchanged.`);
   if (value.length > MAX_SAVED_API_KEY_LENGTH) {
-    throw new Error("That value is too long to save as a TypeSafe API key.");
+    throw new Error(`That value is too long to save as ${article} ${label}.`);
   }
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
@@ -83,16 +108,22 @@ function validate(value: unknown): Config {
         c.contextBudgetTokens < 0)) ||
     typeof c.autoAcknowledged !== "boolean" ||
     (c.logRequests !== undefined && typeof c.logRequests !== "boolean") ||
-    (c.typesafeApiKey !== undefined && typeof c.typesafeApiKey !== "string")
+    (c.typesafeApiKey !== undefined && typeof c.typesafeApiKey !== "string") ||
+    (c.openaiApiKey !== undefined && typeof c.openaiApiKey !== "string") ||
+    (c.judge !== undefined && !JUDGES.includes(c.judge as JudgeName))
   ) {
     throw new Error("Invalid or unsupported settings. Restore a valid version-1 configuration.");
   }
-  parseProfile(c.profile);
-  const typesafeApiKey =
-    typeof c.typesafeApiKey === "string" && c.typesafeApiKey.trim() !== ""
-      ? c.typesafeApiKey.trim()
-      : undefined;
-  if (typesafeApiKey !== undefined && typesafeApiKey.length > MAX_SAVED_API_KEY_LENGTH) {
+  const judge = c.judge as JudgeName | undefined;
+  parseProfile(c.profile, judge ?? DEFAULT_JUDGE);
+  const savedKey = (value: unknown) =>
+    typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+  const typesafeApiKey = savedKey(c.typesafeApiKey);
+  const openaiApiKey = savedKey(c.openaiApiKey);
+  if (
+    (typesafeApiKey !== undefined && typesafeApiKey.length > MAX_SAVED_API_KEY_LENGTH) ||
+    (openaiApiKey !== undefined && openaiApiKey.length > MAX_SAVED_API_KEY_LENGTH)
+  ) {
     throw new Error("Invalid or unsupported settings. Restore a valid version-1 configuration.");
   }
   return {
@@ -102,7 +133,9 @@ function validate(value: unknown): Config {
     contextBudgetTokens: (c.contextBudgetTokens as number | undefined) ?? 0,
     autoAcknowledged: c.autoAcknowledged,
     logRequests: c.logRequests === true,
+    ...(judge !== undefined ? { judge } : {}),
     ...(typesafeApiKey !== undefined ? { typesafeApiKey } : {}),
+    ...(openaiApiKey !== undefined ? { openaiApiKey } : {}),
     ...(c.profile !== undefined ? { profile: c.profile as string } : {}),
   };
 }

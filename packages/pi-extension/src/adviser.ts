@@ -10,23 +10,31 @@ import {
   DEFAULT_CONFIG,
   type Mode,
   parseBudget,
+  parseJudge,
   parseMinimum,
   parseSavedApiKey,
+  SAVED_KEY,
+  selectedJudge,
 } from "./config.ts";
 import { snapshot } from "./context.ts";
 import { DISABLE_ENV, disabledByEnv } from "./disable.ts";
-import { formatKeyStatus, type ResolvedTypesafeApiKey, resolveTypesafeApiKey } from "./env.ts";
+import { formatKeyStatus, type ResolvedApiKey, resolveApiKey } from "./env.ts";
 import {
+  API_KEY_ENV,
   contextPressure,
+  DEFAULT_JUDGE,
+  decide,
+  decisionsRequestBody,
   effectiveBudget,
   floorFor,
-  JUDGE_UNAVAILABLE_MESSAGE,
   JudgeError,
-  type Judgment,
+  type JudgeName,
   judge,
+  judgeUnavailableMessage,
   qualifies,
   requestBody,
   typesafeEndpoint,
+  type Verdict,
 } from "./judge.ts";
 import { promptSecret } from "./key-input.ts";
 import { appendErrorLog, appendRequestLog, appendResponseLog, requestLogPath } from "./log.ts";
@@ -44,7 +52,7 @@ import {
 const LABEL = "compact-adviser";
 const HINT = "Compact adviser: work appears completed or recorded. Run /compact to save tokens.";
 const USAGE =
-  "Use /compact-adviser, auto, hint, off, status, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.";
+  "Use /compact-adviser, auto, hint, off, status, judge <decisions|jev>, threshold <tokens|default>, budget <tokens|off>, snooze or dismiss.";
 interface Options {
   agentDir: string;
   version: string;
@@ -54,14 +62,22 @@ interface Options {
     state: unknown,
     key: string,
     signal: AbortSignal,
-    profile?: JudgeProfile,
-  ) => Promise<Judgment>;
+    profile: JudgeProfile | undefined,
+    judge: JudgeName,
+  ) => Promise<Verdict>;
 }
-function savedApiKey(store: ConfigStore): string | undefined {
+function savedApiKey(store: ConfigStore, judge: JudgeName): string | undefined {
   try {
-    return store.read().typesafeApiKey;
+    return store.read()[SAVED_KEY[judge].field];
   } catch {
     return undefined;
+  }
+}
+function currentJudge(store: ConfigStore): JudgeName {
+  try {
+    return selectedJudge(store.read());
+  } catch {
+    return DEFAULT_JUDGE;
   }
 }
 export function installAdviser(pi: ExtensionAPI, options: Options): void {
@@ -69,20 +85,25 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
   // and re-reading it per event would only invite a mid-session half-disabled state.
   if (disabledByEnv(process.env[DISABLE_ENV])) return;
   const store = new ConfigStore(options.agentDir);
-  const resolvedKey = (cwd = process.cwd()): ResolvedTypesafeApiKey => {
+  /** The selected judge's key: launch environment, then the saved key, then the cwd `.env`. */
+  const resolvedKey = (
+    cwd = process.cwd(),
+    judgeName: JudgeName = currentJudge(store),
+  ): ResolvedApiKey => {
     if (options.key) {
       const value = options.key();
       return value !== undefined && value.trim() !== ""
         ? { value, source: "env" }
         : { value: undefined, source: "missing" };
     }
-    return resolveTypesafeApiKey(process.env, cwd, savedApiKey(store));
+    return resolveApiKey(API_KEY_ENV[judgeName], process.env, cwd, savedApiKey(store, judgeName));
   };
-  const key = (cwd?: string) => resolvedKey(cwd).value;
+  const key = (cwd?: string, judgeName?: JudgeName) => resolvedKey(cwd, judgeName).value;
   const now = options.now ?? Date.now;
   const evaluate =
     options.evaluate ??
-    ((state, key, signal, profile) => {
+    ((state, key, signal, profile, judgeName): Promise<Verdict> => {
+      if (judgeName === "decisions") return decide(state, key, signal);
       const endpoint = typesafeEndpoint(process.env.TYPESAFE_BASE);
       if (endpoint === undefined) return Promise.reject(new JudgeError("configuration"));
       return judge(state, key, signal, undefined, undefined, profile, endpoint);
@@ -133,7 +154,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
       ctx.hasPendingMessages() ||
       ctx.ui.getEditorText?.().trim() ||
       c.mode === "off" ||
-      !key(ctx.cwd)?.trim() ||
+      !key(ctx.cwd, selectedJudge(c))?.trim() ||
       !usage ||
       usage.tokens === null ||
       !Number.isFinite(usage.tokens) ||
@@ -182,13 +203,22 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
       return;
     }
     if (request || eligible(ctx, config, state) === undefined) return;
-    const profile = parseProfile(config.profile);
-    const view = snapshot(ctx, [key(ctx.cwd), savedApiKey(store)]);
+    const judgeName = selectedJudge(config);
+    const profile = parseProfile(config.profile, judgeName);
+    const view = snapshot(ctx, [
+      key(ctx.cwd, judgeName),
+      savedApiKey(store, "decisions"),
+      savedApiKey(store, "jev"),
+    ]);
     if (view.conversationTokens <= 20000 || view.checkpointKey === state.lastHintKey) return;
+    const body = () =>
+      judgeName === "decisions"
+        ? decisionsRequestBody(view.state)
+        : requestBody(view.state, profile);
     let loggedBody: string | undefined;
     if (config.logRequests) {
       try {
-        loggedBody = requestBody(view.state, profile);
+        loggedBody = body();
         appendRequestLog(options.agentDir, loggedBody);
       } catch {
         // Request logging must not replace or delay the judgment.
@@ -204,16 +234,17 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
     try {
       const result = await evaluate(
         view.state,
-        key(ctx.cwd)?.trim() ?? "",
+        key(ctx.cwd, judgeName)?.trim() ?? "",
         controller.signal,
         profile,
+        judgeName,
       );
       if (!current()) return;
       if (config.logRequests) {
         try {
           appendResponseLog(
             options.agentDir,
-            loggedBody ?? requestBody(view.state, profile),
+            loggedBody ?? body(),
             result,
             usageFraction(ctx, config),
             profile,
@@ -288,7 +319,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
         ctx,
         error instanceof Error && error.name === "JudgeError"
           ? error.message
-          : JUDGE_UNAVAILABLE_MESSAGE,
+          : judgeUnavailableMessage(judgeName),
       );
     } finally {
       if (request === controller) request = undefined;
@@ -392,7 +423,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
       save(
         ctx,
         { mode, autoAcknowledged: true },
-        "Automatic mode saved (all sessions). A TypeSafe key is still required.",
+        `Automatic mode saved (all sessions). ${currentJudge(store) === "decisions" ? "An OpenAI" : "A TypeSafe"} key is still required.`,
       );
     } else
       save(
@@ -424,49 +455,68 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
         : "Context budget off (all sessions): the hint floor follows the model's window.",
     );
   }
+  function changeJudge(ctx: ExtensionCommandContext, text: string) {
+    const judgeName = parseJudge(text);
+    save(
+      ctx,
+      { judge: judgeName },
+      judgeName === "decisions"
+        ? "Judge saved: OpenAI Decisions (all sessions). It reads OPENAI_DECISIONS_API_KEY or a saved OpenAI key."
+        : "Judge saved: TypeSafe Jev (all sessions). It reads TYPESAFE_API_KEY or a saved TypeSafe key.",
+    );
+  }
   function status(ctx: ExtensionCommandContext) {
     const c = store.read(),
+      judgeName = selectedJudge(c),
       s = restoreState(ctx.sessionManager.getBranch()),
       usage = ctx.getContextUsage(),
       t = usage?.tokens,
       u = usageFraction(ctx, c);
     ctx.ui.notify(
-      `Mode: ${c.mode}. Minimum: ${c.minContextTokens.toLocaleString("en-US")} tokens. Budget: ${c.contextBudgetTokens > 0 ? `${c.contextBudgetTokens.toLocaleString("en-US")} tokens` : "off"}. Context: ${t ?? "unknown"}${Number.isFinite(u) ? ` (${Math.round(u * 100)}% of the ${effectiveBudget(usage?.contextWindow ?? Number.NaN, c.contextBudgetTokens) > 0 ? "budget" : "window"}; hint floor ${floorFor(u, parseProfile(c.profile)).toFixed(2)})` : ""}. ${formatKeyStatus(resolvedKey(ctx.cwd).source)}. ${typeof t === "number" ? `${cooldownReason(s, t, now()) ?? "No cooldown; semantic checks still apply"}.` : "Waiting for fresh model usage."} Request log: ${c.logRequests ? requestLogPath(options.agentDir) : "off"}. Settings: ${store.path}`,
+      `Mode: ${c.mode}. Judge: ${judgeName}. Minimum: ${c.minContextTokens.toLocaleString("en-US")} tokens. Budget: ${c.contextBudgetTokens > 0 ? `${c.contextBudgetTokens.toLocaleString("en-US")} tokens` : "off"}. Context: ${t ?? "unknown"}${Number.isFinite(u) ? ` (${Math.round(u * 100)}% of the ${effectiveBudget(usage?.contextWindow ?? Number.NaN, c.contextBudgetTokens) > 0 ? "budget" : "window"}; hint floor ${floorFor(u, parseProfile(c.profile, judgeName), judgeName).toFixed(2)})` : ""}. ${formatKeyStatus(resolvedKey(ctx.cwd, judgeName).source)}. ${typeof t === "number" ? `${cooldownReason(s, t, now()) ?? "No cooldown; semantic checks still apply"}.` : "Waiting for fresh model usage."} Request log: ${c.logRequests ? requestLogPath(options.agentDir) : "off"}. Settings: ${store.path}`,
       "info",
     );
   }
+  const company = (judgeName: JudgeName) => (judgeName === "decisions" ? "OpenAI" : "TypeSafe");
   async function changeLogRequests(ctx: ExtensionCommandContext, enabled: boolean) {
+    const name = company(currentJudge(store));
     save(
       ctx,
       { logRequests: enabled },
       enabled
-        ? `TypeSafe request logging on (all sessions). ${requestLogPath(options.agentDir)}`
-        : "TypeSafe request logging off (all sessions).",
+        ? `${name} request logging on (all sessions). ${requestLogPath(options.agentDir)}`
+        : `${name} request logging off (all sessions).`,
     );
   }
-  function changeSavedApiKey(ctx: ExtensionCommandContext, text: string) {
+  function changeSavedApiKey(ctx: ExtensionCommandContext, text: string, judgeName: JudgeName) {
+    const { field, label } = SAVED_KEY[judgeName];
     save(
       ctx,
-      { typesafeApiKey: parseSavedApiKey(text) },
-      "TypeSafe API key saved (all sessions). Status shows the source, never the value.",
+      { [field]: parseSavedApiKey(text, judgeName) },
+      `${label} saved (all sessions). Status shows the source, never the value.`,
     );
   }
-  function clearSavedApiKey(ctx: ExtensionCommandContext) {
+  function clearSavedApiKey(ctx: ExtensionCommandContext, judgeName: JudgeName) {
+    const { field, label } = SAVED_KEY[judgeName];
     save(
       ctx,
-      { typesafeApiKey: "" },
-      "Saved TypeSafe API key cleared (all sessions). Launch environment and .env still apply.",
+      { [field]: "" },
+      `Saved ${label} cleared (all sessions). Launch environment and .env still apply.`,
     );
   }
   async function menu(ctx: ExtensionCommandContext) {
     while (true) {
       const c = store.read();
-      const keyLabel = `TypeSafe API key: ${c.typesafeApiKey ? "saved" : "not saved"}`;
+      const judgeName = selectedJudge(c);
+      const { field, label } = SAVED_KEY[judgeName];
+      const keyLabel = `${label}: ${c[field] ? "saved" : "not saved"}`;
+      const judgeLabel = `Judge: ${judgeName === "decisions" ? "OpenAI Decisions" : "TypeSafe Jev"}`;
       const labels = [
         `Mode: ${c.mode}`,
         `Minimum context: ${c.minContextTokens.toLocaleString("en-US")} tokens`,
-        `Log TypeSafe requests: ${c.logRequests ? "on" : "off"}`,
+        `Log ${company(judgeName)} requests: ${c.logRequests ? "on" : "off"}`,
         keyLabel,
+        judgeLabel,
         "Reset minimum to 40,000",
         "Status",
         "Close",
@@ -499,28 +549,34 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
           }
         }
       } else if (selected === labels[2]) {
-        const logging = await ctx.ui.select("Log TypeSafe requests", ["Off (default)", "On"]);
+        const logging = await ctx.ui.select(`Log ${company(judgeName)} requests`, [
+          "Off (default)",
+          "On",
+        ]);
         if (logging) await changeLogRequests(ctx, logging.startsWith("On"));
       } else if (selected === keyLabel) {
-        const actions = c.typesafeApiKey ? ["Set key", "Clear saved key"] : ["Set key"];
-        const action = await ctx.ui.select("TypeSafe API key", actions);
-        if (action === "Clear saved key") clearSavedApiKey(ctx);
+        const actions = c[field] ? ["Set key", "Clear saved key"] : ["Set key"];
+        const action = await ctx.ui.select(label, actions);
+        if (action === "Clear saved key") clearSavedApiKey(ctx, judgeName);
         else if (action === "Set key") {
           while (true) {
-            const input = await promptSecret(ctx);
+            const input = await promptSecret(ctx, label);
             if (input === undefined) break;
             try {
-              changeSavedApiKey(ctx, input);
+              changeSavedApiKey(ctx, input, judgeName);
               break;
             } catch (error) {
               ctx.ui.notify(
-                error instanceof Error ? error.message : "Could not save the TypeSafe API key.",
+                error instanceof Error ? error.message : `Could not save the ${label}.`,
                 "error",
               );
             }
           }
         }
-      } else if (selected === labels[4]) minimum(ctx, "default");
+      } else if (selected === judgeLabel) {
+        const choice = await ctx.ui.select("Judge", ["OpenAI Decisions (default)", "TypeSafe Jev"]);
+        if (choice) changeJudge(ctx, choice.startsWith("OpenAI") ? "decisions" : "jev");
+      } else if (selected === labels[5]) minimum(ctx, "default");
       else status(ctx);
     }
   }
@@ -532,6 +588,8 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
         "hint",
         "off",
         "status",
+        "judge decisions",
+        "judge jev",
         "threshold ",
         "threshold default",
         "budget ",
@@ -549,6 +607,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
         if (!command) await menu(ctx);
         else if (["auto", "hint", "off"].includes(command) && !value)
           await changeMode(ctx, command as Mode);
+        else if (command === "judge" && value) changeJudge(ctx, value);
         else if (command === "threshold" && value) minimum(ctx, value);
         else if (command === "budget" && value) budget(ctx, value);
         else if (command === "status" && !value) status(ctx);

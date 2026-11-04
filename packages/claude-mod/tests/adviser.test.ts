@@ -146,6 +146,26 @@ describe("the judge switch", () => {
     expect(response.answers).toEqual({ finished: 0.99, hands_on: 0.99 });
   });
 
+  test("a TypeSafe key in the environment never reaches OpenAI", async ($, on) => {
+    const w = world(on, { judge: "decisions", openaiKey: OPENAI_KEY, logRequests: true });
+    w.messages = longConversation(`Use ${KEY} for the other service.`);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(w.journal.requests[0]?.body.includes(KEY)).toBe(false);
+    for (const write of w.journal.fsWrites) expect(write.text.includes(KEY)).toBe(false);
+  });
+
+  test("an OpenAI key in the environment never reaches TypeSafe", async ($, on) => {
+    const w = world(on, { judge: "jev", openaiKey: OPENAI_KEY, logRequests: true });
+    w.messages = longConversation(`Use ${OPENAI_KEY} for the other service.`);
+    await $.session.start(interactiveStart);
+    await turnEnd($, w);
+    expect(w.journal.requests).toHaveLength(1);
+    expect(w.journal.requests[0]?.body.includes(OPENAI_KEY)).toBe(false);
+    for (const write of w.journal.fsWrites) expect(write.text.includes(OPENAI_KEY)).toBe(false);
+  });
+
   test("judge jev asks TypeSafe with the TypeSafe key even when an OpenAI key is set", async ($, on) => {
     const w = world(on, { judge: "jev", openaiKey: OPENAI_KEY });
     await $.session.start(interactiveStart);
@@ -1814,6 +1834,17 @@ describe("walking away", () => {
     expect(w.journal.requests).toHaveLength(2);
     expect(w.journal.statuses.filter((s) => s)).toHaveLength(0);
     expect(w.journal.toasts).toHaveLength(0);
+  });
+
+  test("without a key for the selected judge, walking away does nothing", async ($, on) => {
+    const w = awayWorld(on, unfinished, { key: undefined });
+    await $.session.start(interactiveStart);
+    await twoTurns($, w);
+    await w.clock.advance(3 * 60 * MINUTE);
+    await drain(w);
+    expect(w.journal.requests).toHaveLength(0);
+    expect(w.journal.forks).toHaveLength(0);
+    expect(w.journal.compactions).toHaveLength(0);
   });
 
   test("keepWarmHours 0 turns warming off", async ($, on) => {

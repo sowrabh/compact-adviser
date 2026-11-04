@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,7 @@ import {
   parseMode,
   parseSavedApiKey,
 } from "../src/config.ts";
+import { QUESTIONS } from "../src/judge.ts";
 import { adviserRoot, codexHome } from "../src/paths.ts";
 import { initialState } from "../src/state.ts";
 import { SessionStore } from "../src/store.ts";
@@ -277,5 +278,31 @@ test("the CLI saves the OpenAI key for the default judge without printing it", a
     assert.equal(store.read().typesafeApiKey, undefined);
     assert.ok(!saved.includes("sk-typed"));
     assert.equal(await run(["key", "status"], cli(lab)), "Key: saved");
+  });
+});
+
+test("a Jev profile with questions, invalid under the Decisions default, is repaired by judge jev", async () => {
+  await withLab(async (lab) => {
+    const store = new ConfigStore(adviserRoot({ CODEX_HOME: lab.home }));
+    mkdirSync(dirname(store.path), { recursive: true });
+    const profile = JSON.stringify({
+      version: 1,
+      coordinationWeight: 0.5,
+      floors: [[0, 0.6]],
+      questions: QUESTIONS,
+    });
+    writeFileSync(
+      store.path,
+      JSON.stringify({ version: 1, mode: "hint", minContextTokens: 40000, profile }),
+    );
+    assert.throws(() => store.read(), /settings/);
+    assert.match(await run(["judge", "jev"], cli(lab)), /Judge saved: TypeSafe Jev/);
+    assert.equal(store.read().judge, "jev");
+    assert.equal(store.read().profile, profile);
+    writeFileSync(
+      store.path,
+      JSON.stringify({ version: 2, mode: "hint", minContextTokens: 40000 }),
+    );
+    await assert.rejects(run(["judge", "jev"], cli(lab)));
   });
 });

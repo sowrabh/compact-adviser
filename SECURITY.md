@@ -18,7 +18,7 @@ The API key never enters the model context or the request body; it is sent as th
 Errors, timeouts, malformed responses, refusals, and contradictory factors never substitute an affirmative judgment.
 OpenAI keeps API inputs for up to 30 days for abuse monitoring unless the account has Zero Data Retention, and does not train on API data by default.
 
-Keep-warm (Claude Code, confirmed automatic mode only) sends nothing to either judge. When the person has walked away from an unfinished session, it replays the session's own last request to Anthropic through Claude Code's `$.model.fork`, with one added line (`Reply with exactly: OK`), on the person's model quota. The request and the reply stay out of the transcript, and warming stops at `keepWarmHours`, at the break-even ping count, on a cache miss, on a failed fork, or at any sign of the person.
+Keep-warm (Claude Code, confirmed automatic mode only) sends nothing to either judge. When the person has walked away from an unfinished session, it replays the session's own last request to Anthropic through Claude Code's `$.model.fork`, with one added line (`Reply with exactly: OK`), on the person's model quota. The request and the reply stay out of the transcript, and warming stops at `keepWarmHours`, on a cache miss, on a failed fork, or at any sign of the person.
 
 Automatic compaction on Pi and Claude Code is experimental and lossy, and it now also acts once the person has walked away; Codex and Grok are hint-only because an outside process cannot trigger `/compact` in their running sessions. An automatic-mode acknowledgement saved before walk-away compaction existed does not count; auto asks again.
 A high model probability is not proof of preservation or continuation quality.

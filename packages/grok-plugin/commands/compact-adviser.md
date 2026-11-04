@@ -17,7 +17,8 @@ Rules for this command:
 - Print what the CLI printed. It never prints an API key, only where the key in effect
   came from, so there is nothing to redact - and nothing to paraphrase either.
 - Never pass an API key to the CLI. Save the key from a shell outside this session, or
-  set `TYPESAFE_API_KEY` or a cwd `.env`. Do not type secrets after this slash command; Grok
+  set the selected judge's key (`OPENAI_DECISIONS_API_KEY` by default, `TYPESAFE_API_KEY` for
+  jev) or put it in a cwd `.env`. Do not type secrets after this slash command; Grok
   appends extra words to the model.
 - Never ask the CLI for the hint text, and never paste or paraphrase the hint into the
   conversation. The hint is only for the status row.

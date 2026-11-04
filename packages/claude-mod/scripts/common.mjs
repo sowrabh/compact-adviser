@@ -33,3 +33,16 @@ export function run(args, options = {}) {
 export function claudeVersion() {
   return run(["--version"]).output.trim();
 }
+
+/** One shell word: single-quoted, so `$`, backticks, and quotes in it stay literal. */
+export function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+/** `NAME='value' ...` for an `env -i` command line, from a child environment. */
+export function shellExports(env) {
+  return Object.entries(env)
+    .filter(([name, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && value !== undefined)
+    .map(([name, value]) => `${name}=${shellQuote(value)}`)
+    .join(" ");
+}

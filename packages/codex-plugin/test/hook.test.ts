@@ -588,3 +588,27 @@ test("a Decisions refusal stays silent and backs off", async () => {
     lab.cleanup();
   }
 });
+
+test("the other judge's key in the environment never reaches the selected judge", async () => {
+  const lab = makeLab();
+  try {
+    writeRollout(lab.transcript, settledRollout());
+    const rollout = readFileSync(lab.transcript, "utf8").replace(
+      "Done: the parser",
+      "Use tsk-env-only-secret elsewhere. Done: the parser",
+    );
+    writeFileSync(lab.transcript, rollout);
+    const judge = fakeTypesafe(() => ({ body: decisionsReply() }));
+    const env = {
+      CODEX_HOME: lab.home,
+      TYPESAFE_API_KEY: "tsk-env-only-secret",
+      OPENAI_DECISIONS_API_KEY: "sk-openai-fixture",
+    };
+    await handle(stop(lab), environment(lab, { env, fetch: judge.fetch }));
+    assert.equal(judge.requests.length, 1);
+    assert.ok(rollout.includes("tsk-env-only-secret"));
+    assert.ok(!JSON.stringify(judge.requests[0]?.body).includes("tsk-env-only-secret"));
+  } finally {
+    lab.cleanup();
+  }
+});

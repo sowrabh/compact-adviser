@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CLAUDE, claudeEnv, PACKAGE, run } from "./common.mjs";
+import { CLAUDE, claudeEnv, PACKAGE, run, shellExports, shellQuote } from "./common.mjs";
 
 const TARGET = join(PACKAGE, ".claude", "types");
 const WRITTEN = join(PACKAGE, ".claude-plugin", "types");
@@ -56,11 +56,8 @@ async function fromSession(lab) {
     DISABLE_AUTOUPDATER: "1",
   });
   delete env.COMPACT_ADVISER_DISABLE;
-  const exports = Object.entries(env)
-    .filter(([name]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
-    .map(([name, value]) => `${name}=${JSON.stringify(value).replace(/\$/g, "\\$")}`)
-    .join(" ");
-  const cmd = `env -i ${exports} ${JSON.stringify(CLAUDE)} --plugin-dir ${JSON.stringify(PACKAGE)}`;
+  const exports = shellExports(env);
+  const cmd = `env -i ${exports} ${shellQuote(CLAUDE)} --plugin-dir ${shellQuote(PACKAGE)}`;
   const tmux = (...args) => execFileSync("tmux", ["-L", socket, ...args], { stdio: "ignore" });
   tmux("new-session", "-d", "-s", "types", "-x", "120", "-y", "40", "-c", lab, cmd);
   try {

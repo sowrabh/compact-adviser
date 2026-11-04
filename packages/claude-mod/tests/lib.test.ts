@@ -10,7 +10,7 @@ import {
   readConfig,
 } from "../lib/config.ts";
 import { parseDotenvKey, resolveTypesafeApiKey } from "../lib/env.ts";
-import { breakEvenPings, cacheHeld, cacheTtl, idleDelayMs, walkAwayAction } from "../lib/idle.ts";
+import { cacheHeld, cacheTtl, idleDelayMs, walkAwayAction } from "../lib/idle.ts";
 import {
   ENDPOINT,
   FLOOR_MAX,
@@ -787,11 +787,6 @@ describe("walking away", () => {
     expect(idleDelayMs(cacheTtl({ force5m: "1", subscription: false }), 30)).toBe(30 * MINUTE);
   });
 
-  test("warming stops where its pings would cost one cache rebuild", () => {
-    expect(breakEvenPings(HOUR)).toBe(20);
-    expect(breakEvenPings(5 * MINUTE)).toBe(12);
-  });
-
   const base = {
     auto: true,
     tokens: 120000,
@@ -803,8 +798,6 @@ describe("walking away", () => {
     keepWarmHours: 8,
     idleSince: 0,
     now: 50 * MINUTE,
-    pings: 0,
-    ttlMs: HOUR,
   };
 
   test("a finished checkpoint compacts; an unfinished one keeps the cache warm", () => {
@@ -819,15 +812,14 @@ describe("walking away", () => {
     expect(walkAwayAction({ ...base, tokens: undefined }).action).toBe("none");
   });
 
-  test("keep-warm needs two exchanges, caching, budget left, and time left", () => {
+  test("keep-warm needs two exchanges, caching, and time left", () => {
     expect(walkAwayAction({ ...base, completed: 1 }).action).toBe("none");
     expect(walkAwayAction({ ...base, caching: false }).action).toBe("none");
     expect(walkAwayAction({ ...base, keepWarmHours: 0 }).action).toBe("none");
     expect(walkAwayAction({ ...base, now: 8 * HOUR - 1 }).action).toBe("warm");
     expect(walkAwayAction({ ...base, now: 8 * HOUR }).action).toBe("none");
-    expect(walkAwayAction({ ...base, pings: 19 }).action).toBe("warm");
-    expect(walkAwayAction({ ...base, pings: 20 }).action).toBe("none");
-    expect(walkAwayAction({ ...base, ttlMs: 5 * MINUTE, pings: 12 }).action).toBe("none");
+    // Only the hours bound warming, whatever the cache TTL: there is no ping-count cap.
+    expect(walkAwayAction({ ...base, now: 7 * HOUR }).action).toBe("warm");
   });
 
   test("a ping counts as a hit only when the cache served nearly all of the prompt", () => {

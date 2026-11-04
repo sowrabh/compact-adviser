@@ -162,13 +162,16 @@ export class ConfigStore {
     this.path = join(agentDir, "compact-adviser.json");
   }
   read(): Config {
+    return this.load(validate);
+  }
+  private load<T>(parse: (value: unknown) => T): T {
     try {
       const stat = lstatSync(this.path);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16384)
         throw new Error("Unsafe settings file.");
-      return validate(JSON.parse(readFileSync(this.path, "utf8")));
+      return parse(JSON.parse(readFileSync(this.path, "utf8")));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...DEFAULT_CONFIG };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return parse({ ...DEFAULT_CONFIG });
       throw new Error("Cannot read compact-adviser settings; automatic action is disabled.", {
         cause: error,
       });
@@ -181,7 +184,15 @@ export class ConfigStore {
     const release = lockSync(this.path, { realpath: false, stale: 10000 });
     const temp = `${this.path}.${randomUUID()}.tmp`;
     try {
-      const config = validate({ ...this.read(), ...patch });
+      // Validate the merge, not the stored file first, so a patch can repair the field that
+      // made the file invalid (such as `judge: "jev"` for a Jev-only profile); fields it does
+      // not touch must still be valid.
+      const stored = this.load((value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+          throw new Error("Invalid settings.");
+        return value as Record<string, unknown>;
+      });
+      const config = validate({ ...stored, ...patch });
       const fd = openSync(temp, "wx", 0o600);
       try {
         writeFileSync(fd, `${JSON.stringify(config, null, 2)}\n`);

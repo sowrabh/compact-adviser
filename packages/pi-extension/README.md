@@ -185,7 +185,7 @@ In confirmed automatic mode, a settled answer also arms a walk-away point on Cla
 
 - It fires at the cache TTL minus 10 minutes (50 minutes on a 1-hour cache), or 1 minute before a 5-minute cache ends (4 minutes). When the TTL is unknown it uses 50 minutes. `idleMinutes` replaces this with a fixed number of minutes.
 - If that answer's turn-end score reaches the schedule's loosest floor (0.50 by default), it compacts once, running `beforeCompactPrompt` first on Claude Code. Backoff, snooze, the wait after a compaction, and the minimum context still apply.
-- Otherwise, including when the judge failed or was not asked, it never compacts. On Claude Code it keeps the cache warm instead: a one-line fork of the session's own request each cache cycle, up to `keepWarmHours` (8 by default; 0 turns it off). It stops once the pings would have cost as much as one cache rebuild (20 pings on a 1-hour cache, 12 on a 5-minute one), on a ping that misses the cache, on a failed fork, before the session's second exchange, and as soon as you are back. Pi has no keep-warm.
+- Otherwise, including when the judge failed or was not asked, it never compacts. On Claude Code it keeps the cache warm instead: a one-line fork of the session's own request each cache cycle, up to `keepWarmHours` (8 by default; 0 turns it off). It stops on a ping that misses the cache, on a failed fork, before the session's second exchange, and as soon as you are back. Pi has no keep-warm.
 
 Claude Code's own threshold auto-compact is unchanged and still catches what the adviser does not. Hint mode, Codex and Grok never act on walk-away.
 

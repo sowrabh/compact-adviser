@@ -203,7 +203,15 @@ async function onStop(payload: HookPayload, environment: Environment): Promise<H
   if (tokens < config.minContextTokens) return {};
   if (cooldownReason(state, tokens, now) !== undefined) return {};
 
-  const view = snapshot(rollout.messages, [key.value, config.typesafeApiKey, config.openaiApiKey], {
+  // Both judges' keys are scrubbed, so neither provider ever receives the other's.
+  const scrub = [
+    key.value,
+    environment.env.OPENAI_DECISIONS_API_KEY,
+    environment.env.TYPESAFE_API_KEY,
+    config.typesafeApiKey,
+    config.openaiApiKey,
+  ];
+  const view = snapshot(rollout.messages, scrub, {
     truncated: rollout.truncated,
   });
   if (view.conversationTokens <= MINIMUM_CONVERSATION_TOKENS) return {};

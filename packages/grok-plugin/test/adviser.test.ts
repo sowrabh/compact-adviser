@@ -685,3 +685,39 @@ test("the shell CLI saves the judge, refuses others, and status names it", async
   assert.match(refused.stderr, /decisions or jev/);
   assert.match((await runCli(["status"], { lab: l })).stdout, /Judge: decisions\./);
 });
+
+test("the other judge's key in the environment never reaches the selected judge", async (t) => {
+  const { l, fixture } = await judgeTurn(t);
+  writeFileSync(join(l.dataDir, "settings.json"), '{"version":1,"judge":"decisions"}');
+  writeHistory(l, [
+    ...workedHistory("one"),
+    { type: "assistant", content: "Use tsk-env-only-secret elsewhere. It is committed." },
+  ]);
+  await runCli(["hook", "stop"], {
+    lab: l,
+    stdin: stopPayload(l),
+    env: {
+      COMPACT_ADVISER_TEST_ENDPOINT: fixture.url,
+      TYPESAFE_API_KEY: "tsk-env-only-secret",
+      OPENAI_DECISIONS_API_KEY: "sk-openai-test-key",
+    },
+  });
+  assert.equal(fixture.bodies.length, 1);
+  assert.ok(!(fixture.bodies[0] ?? "").includes("tsk-env-only-secret"));
+});
+
+test("a Jev profile with questions, invalid under the Decisions default, is repaired by judge jev", async (t) => {
+  const { QUESTIONS } = await import("../lib/judge.ts");
+  const l = lab(t);
+  const profile = JSON.stringify({
+    version: 1,
+    coordinationWeight: 0.5,
+    floors: [[0, 0.6]],
+    questions: QUESTIONS,
+  });
+  writeFileSync(join(l.dataDir, "settings.json"), JSON.stringify({ version: 1, profile }));
+  assert.equal((await runCli(["status"], { lab: l })).code, 1);
+  const saved = await runCli(["judge", "jev"], { lab: l });
+  assert.equal(saved.code, 0, saved.stderr);
+  assert.match((await runCli(["status"], { lab: l })).stdout, /Judge: jev\./);
+});

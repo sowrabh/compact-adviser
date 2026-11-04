@@ -52,14 +52,6 @@ export function idleDelayMs(ttl: CacheTtl, idleMinutes: number): number {
   return ttl.ttlMs - Math.min(IDLE_MARGIN_MS, ttl.ttlMs / 5);
 }
 
-/**
- * How many keep-warm pings cost as much as rebuilding the cache once: a cache read bills a
- * tenth of input, a write 2x on a 1 h cache and 1.25x on a 5 min one.
- */
-export function breakEvenPings(ttlMs: number): number {
-  return ttlMs <= SHORT_TTL_MS ? 12 : 20;
-}
-
 export type WalkAway =
   | { action: "compact" }
   | { action: "warm" }
@@ -81,8 +73,6 @@ export function walkAwayAction(input: {
   keepWarmHours: number;
   idleSince: number;
   now: number;
-  pings: number;
-  ttlMs: number;
 }): WalkAway {
   if (!input.auto) return { action: "none", reason: "automatic mode is not confirmed" };
   if (input.tokens === undefined || input.tokens < input.minContextTokens) {
@@ -94,9 +84,6 @@ export function walkAwayAction(input: {
   if (input.completed < 2) return { action: "none", reason: "fewer than two exchanges" };
   if (input.now - input.idleSince >= input.keepWarmHours * 60 * MINUTE) {
     return { action: "none", reason: "the keep-warm cap is reached" };
-  }
-  if (input.pings >= breakEvenPings(input.ttlMs)) {
-    return { action: "none", reason: "more pings would cost more than a rebuild" };
   }
   return { action: "warm" };
 }

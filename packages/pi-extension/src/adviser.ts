@@ -295,8 +295,11 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
     if (request || eligible(ctx, config, state) === undefined) return;
     const judgeName = selectedJudge(config);
     const profile = parseProfile(config.profile, judgeName);
+    // Both judges' keys are scrubbed, so neither provider ever receives the other's.
     const view = snapshot(ctx, [
       key(ctx.cwd, judgeName),
+      process.env.OPENAI_DECISIONS_API_KEY,
+      process.env.TYPESAFE_API_KEY,
       savedApiKey(store, "decisions"),
       savedApiKey(store, "jev"),
     ]);

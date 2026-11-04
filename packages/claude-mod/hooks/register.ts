@@ -130,6 +130,8 @@ let beforeCompact:
       turnId?: string;
       /** True once this handoff has asked the host to start its turn. */
       dispatched?: boolean;
+      /** Started by the walk-away decision, so typing in the prompt box abandons it. */
+      fromAway?: boolean;
     }
   | undefined;
 let beforeCompactSeq = 0;
@@ -154,7 +156,6 @@ let away:
       delayMs: number;
       /** The turn-end score of this checkpoint, when the judge answered. */
       score?: number;
-      pings: number;
     }
   | undefined;
 let awaySeq = 0;
@@ -407,10 +408,11 @@ async function armBeforeCompact(
   key: string,
   text: string,
   epoch: number,
+  fromAway = false,
 ): Promise<void> {
   if (epoch !== generation || compacting || beforeCompact || foreignSubmitted) return;
   const seq = ++beforeCompactSeq;
-  beforeCompact = { seq, key, dispatched: false };
+  beforeCompact = { seq, key, dispatched: false, fromAway };
   $.ui.status(BEFORE_COMPACT_STATUS);
   $.clock.after(BEFORE_COMPACT_TIMEOUT_MS, () => {
     if (beforeCompact?.seq !== seq) return;
@@ -488,13 +490,19 @@ async function judgeCheckpoint($: EngineInterface, epoch: number): Promise<void>
   try {
     const initial = await loadConfig($);
     const profile = parseProfile(initial.profile, initial.judge);
-    const [messages, activeKey, rows] = await Promise.all([
+    const [messages, activeKey, rows, openaiFromEnv, typesafeFromEnv] = await Promise.all([
       $.session.messages(),
       apiKey($, initial.judge),
       $.config.list(),
+      $.env.get("OPENAI_DECISIONS_API_KEY"),
+      $.env.get("TYPESAFE_API_KEY"),
     ]);
+    // Both judges' keys are scrubbed, so neither provider ever receives the other's. A cwd
+    // `.env` is not read for the unselected judge; the snapshot redacts `.env` reads already.
     const view = snapshot(messages, [
       activeKey,
+      openaiFromEnv,
+      typesafeFromEnv,
       readSavedApiKey(rows, loadedOptions, "decisions"),
       readSavedApiKey(rows, loadedOptions, "jev"),
     ]);
@@ -630,6 +638,8 @@ async function armAway(
 ): Promise<void> {
   away = undefined;
   if (config.mode !== "auto" || !config.autoAcknowledged) return;
+  // No key for the selected judge means the adviser is not set up: it acts on nothing.
+  if ((await apiKey($, config.judge)) === "") return;
   const ttl = await engineCacheTtl($, subscription);
   const seq = ++awaySeq;
   away = {
@@ -639,7 +649,6 @@ async function armAway(
     since: now,
     ttl,
     delayMs: idleDelayMs(ttl, config.idleMinutes),
-    pings: 0,
   };
   scheduleAway($, seq, away.delayMs);
 }
@@ -692,8 +701,6 @@ async function onAway($: EngineInterface, seq: number): Promise<void> {
     keepWarmHours: config.keepWarmHours,
     idleSince: plan.since,
     now,
-    pings: plan.pings,
-    ttlMs: plan.ttl.ttlMs,
   });
   if (decision.action === "none") {
     away = undefined;
@@ -702,7 +709,7 @@ async function onAway($: EngineInterface, seq: number): Promise<void> {
   if (decision.action === "compact") {
     away = undefined;
     if (config.beforeCompactPrompt.trim()) {
-      await armBeforeCompact($, plan.key, config.beforeCompactPrompt, generation);
+      await armBeforeCompact($, plan.key, config.beforeCompactPrompt, generation, true);
       return;
     }
     await compactNow($, plan.key, "away");
@@ -716,7 +723,6 @@ async function onAway($: EngineInterface, seq: number): Promise<void> {
     away = undefined;
     return;
   }
-  plan.pings++;
   scheduleAway($, seq, plan.delayMs);
 }
 
@@ -1117,12 +1123,14 @@ export const register: Register = (on, options) => {
 
   // Typing, a recalled entry, or a cleared box: the person is there, so nothing happens on
   // their behalf. Kept cheap; these run on every edit.
-  on("prompt.edit", async (_$, e, next) => {
+  on("prompt.edit", async ($, e, next) => {
     cancelAway();
+    if (beforeCompact?.fromAway) await abandonBeforeCompact($);
     return next(e);
   });
-  on("prompt.change", async (_$, e, next) => {
+  on("prompt.change", async ($, e, next) => {
     cancelAway();
+    if (beforeCompact?.fromAway) await abandonBeforeCompact($);
     return next(e);
   });
 

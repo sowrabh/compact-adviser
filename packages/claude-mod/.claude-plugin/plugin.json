@@ -79,7 +79,7 @@
     "keepWarmHours": {
       "type": "number",
       "title": "Keep-warm hours",
-      "description": "Automatic mode only. How long it keeps an unfinished session's prompt cache warm after you walk away, with a one-line background request on your model quota each cache cycle. It also stops once the pings would cost as much as one cache rebuild. 0 turns keep-warm off.",
+      "description": "Automatic mode only. How long it keeps an unfinished session's prompt cache warm after you walk away, with a one-line background request on your model quota each cache cycle. 0 turns keep-warm off.",
       "default": 8,
       "min": 0
     },

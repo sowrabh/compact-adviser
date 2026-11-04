@@ -34,7 +34,7 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CLAUDE, claudeEnv, claudeVersion, PACKAGE } from "./common.mjs";
+import { CLAUDE, claudeEnv, claudeVersion, PACKAGE, shellExports, shellQuote } from "./common.mjs";
 
 const HINT = "work appears completed or recorded. Run /compact to save tokens.";
 const API_KEY = "sk-ant-fixture-not-a-real-key-0000000000";
@@ -302,11 +302,8 @@ function launch(flag) {
   // This process may be launched with the product kill switch set. The live harness
   // has to observe the plugin, so it must not inherit that.
   delete env.COMPACT_ADVISER_DISABLE;
-  const exports = Object.entries(env)
-    .filter(([name]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
-    .map(([name, value]) => `${name}=${JSON.stringify(value).replace(/\$/g, "\\$")}`)
-    .join(" ");
-  const cmd = `env -i ${exports} ${JSON.stringify(CLAUDE)} --plugin-dir ${JSON.stringify(PACKAGE)} --model claude-sonnet-4-5 --debug-file ${JSON.stringify(join(lab, `debug-${flag ? "on" : "off"}.log`))}; echo CLAUDE_EXIT=$?; sleep 30`;
+  const exports = shellExports(env);
+  const cmd = `env -i ${exports} ${shellQuote(CLAUDE)} --plugin-dir ${shellQuote(PACKAGE)} --model claude-sonnet-4-5 --debug-file ${shellQuote(join(lab, `debug-${flag ? "on" : "off"}.log`))}; echo CLAUDE_EXIT=$?; sleep 30`;
   tmux("new-session", "-d", "-s", SESSION, "-x", "140", "-y", "45", "-c", project, cmd);
 }
 

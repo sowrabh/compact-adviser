@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { lockSync } from "proper-lockfile";
@@ -695,4 +704,44 @@ test("the walk-away point follows Pi's cache retention, else falls back to 50 mi
   assert.equal(idleDelayMs(piCacheTtl("anthropic-messages", undefined), 0), 4 * MINUTE);
   assert.equal(idleDelayMs(piCacheTtl(undefined, undefined), 0), 50 * MINUTE);
   assert.equal(idleDelayMs(piCacheTtl(undefined, undefined), 15), 15 * MINUTE);
+});
+
+test("a Jev profile with questions, invalid under the Decisions default, is repaired by saving judge jev", async () => {
+  const { QUESTIONS } = await import("../src/judge.ts");
+  const dir = mkdtempSync(join(tmpdir(), "compact-adviser-repair-"));
+  try {
+    const store = new ConfigStore(dir);
+    const profile = JSON.stringify({
+      version: 1,
+      coordinationWeight: 0.5,
+      floors: [[0, 0.6]],
+      questions: QUESTIONS,
+    });
+    writeFileSync(
+      store.path,
+      JSON.stringify({
+        version: 1,
+        mode: "hint",
+        minContextTokens: 40000,
+        autoAcknowledged: false,
+        profile,
+      }),
+    );
+    assert.throws(() => store.read());
+    store.update({ judge: "jev" });
+    assert.equal(store.read().judge, "jev");
+    assert.equal(store.read().profile, profile);
+    writeFileSync(
+      store.path,
+      JSON.stringify({
+        version: 2,
+        mode: "hint",
+        minContextTokens: 40000,
+        autoAcknowledged: false,
+      }),
+    );
+    assert.throws(() => store.update({ judge: "jev" }));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

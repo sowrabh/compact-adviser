@@ -42,6 +42,7 @@ import {
   parseMinimum,
   parseMode,
   parseSavedApiKey,
+  parseSettings,
   readSettings,
   SAVED_KEY,
   type Settings,
@@ -149,11 +150,43 @@ function settingsOrThrow(): Settings {
   return readSettings(settingsPath(env()));
 }
 
+/**
+ * Merges the patch into the stored fields and validates the result as a whole, so a patch can
+ * repair the field that made the file invalid (such as `judge: "jev"` for a Jev-only profile);
+ * fields it does not touch must still be valid.
+ */
 function updateSettings(patch: Partial<Settings>): Settings {
-  const current = settingsOrThrow();
-  const next: Settings = { ...current, ...patch, version: 1 };
+  const next = parseSettings({ ...storedSettings(), ...patch, version: 1 });
   writeSettings(settingsPath(env()), next);
   return next;
+}
+
+/** The settings file's own fields, unvalidated; no file is the defaults. */
+function storedSettings(): Record<string, unknown> {
+  let text: string;
+  try {
+    text = readFileSync(settingsPath(env()), "utf8");
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") return { ...parseSettings(undefined) };
+    throw new SettingsError("Cannot read the compact-adviser settings file; no action is taken.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new SettingsError(
+      "The compact-adviser settings file is not valid JSON; no action is taken.",
+    );
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed as { version?: unknown }).version !== 1
+  ) {
+    throw new SettingsError("Cannot read the compact-adviser settings file; no action is taken.");
+  }
+  return parsed as Record<string, unknown>;
 }
 
 function dotenvKey(cwd: string, name: string): string | undefined {
@@ -364,9 +397,16 @@ async function runStop(payload: HookPayload): Promise<void> {
   const transcript = readTranscript(dir);
   if (transcript.unreadableLines !== 0) return;
   if (!transcript.messages.length) return;
+  // Both judges' keys are scrubbed, so neither provider ever receives the other's.
   const view = snapshot(
     transcript.messages,
-    [activeKey, settings.typesafeApiKey, settings.openaiApiKey],
+    [
+      activeKey,
+      process.env.OPENAI_DECISIONS_API_KEY,
+      process.env.TYPESAFE_API_KEY,
+      settings.typesafeApiKey,
+      settings.openaiApiKey,
+    ],
     transcript.hasImages,
   );
   if (view.conversationTokens <= MINIMUM_CONVERSATION_TOKENS) return;

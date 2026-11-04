@@ -175,25 +175,40 @@ export class ConfigStore {
   }
 
   read(): Config {
+    return this.load(validateConfig);
+  }
+
+  /**
+   * The stored fields, merged with the patch and validated as a whole. Validating the merge,
+   * not the stored file first, lets a patch repair a field that made the file invalid (such
+   * as `judge: "jev"` for a Jev-only profile); fields it does not touch must still be valid.
+   */
+  update(patch: Partial<Omit<Config, "version">>): Config {
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+    const stored = this.load((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Invalid settings.");
+      }
+      return value as Record<string, unknown>;
+    });
+    const config = validateConfig({ ...stored, ...patch });
+    writeAtomic(this.path, `${JSON.stringify(config, null, 2)}\n`);
+    return config;
+  }
+
+  private load<T>(parse: (value: unknown) => T): T {
     try {
       const stat = lstatSync(this.path);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_SETTINGS_BYTES) {
         throw new Error("Unsafe settings file.");
       }
-      return validateConfig(JSON.parse(readFileSync(this.path, "utf8")));
+      return parse(JSON.parse(readFileSync(this.path, "utf8")));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...DEFAULT_CONFIG };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return parse({ ...DEFAULT_CONFIG });
       throw new Error("Cannot read compact-adviser settings; no advice is given.", {
         cause: error,
       });
     }
-  }
-
-  update(patch: Partial<Omit<Config, "version">>): Config {
-    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    const config = validateConfig({ ...this.read(), ...patch });
-    writeAtomic(this.path, `${JSON.stringify(config, null, 2)}\n`);
-    return config;
   }
 }
 

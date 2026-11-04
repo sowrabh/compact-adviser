@@ -905,3 +905,18 @@ test("an acknowledgement saved before walk-away compaction existed does not conf
   await h.command("auto");
   assert.equal((h.store.read() as { consentVersion?: number }).consentVersion, 2);
 });
+
+test("the other judge's key in the environment never reaches the selected judge", async (t) => {
+  withEnv(t, {
+    OPENAI_DECISIONS_API_KEY: "sk-openai-fixture",
+    TYPESAFE_API_KEY: "tsk-env-only-secret",
+  });
+  const requests = stubFetch(t, decisionsReply());
+  const h = harness(t);
+  h.store.update({ judge: "decisions" } as never);
+  h.sm.appendMessage(assistant("Use tsk-env-only-secret for the other service. Done and saved."));
+  h.install("0.82.0", false, true);
+  await h.fire("agent_settled");
+  assert.equal(requests.length, 1);
+  assert.ok(!requests[0]?.body.includes("tsk-env-only-secret"));
+});
